@@ -92,7 +92,7 @@ Options for finding out why boot stops, passed after `run --`:
 | `--setting KEY=VALUE` | a PC setting for this run, not saved (`--setting aspect=16:9`: a scripted run in a wider picture); any number of them |
 | `--vu-record FILE`, `--vu-interpret` | record the VU microprograms a run starts, for compiling ahead of time; run them interpreted (see below) |
 | `--vu-fast` | compiled VU1 programs leave out the MAC and STATUS flags no instruction of theirs can read ("Fast mode" below): exact but for those flags, ~15% less VU1 time; exact is the default unless the game's port chooses it (`SetVuFastDefault`) |
-| `--vu-exact` | compiled VU programs run exactly: their exact blocks, not the native ones ("Native blocks" below; native is the default and ends in the same state), and VU1's exact flags even where the game's port defaults to fast mode |
+| `--vu-exact` | compiled VU programs run exactly: VU1's exact flags even where the game's port defaults to fast mode (and the exact blocks, were native ones made: "Native blocks" below) |
 | `--audio-wav FILE` | the same output recorded to a WAV file, for checking sound without listening |
 | `PS2HOST_AUDIO_LOG=1`, `PS2HOST_AUDIO_MUTE=1`, `PS2HOST_SPU_LOG=1`, `PS2HOST_SPU_NO_REVERB=1` | sound, looked into: every two seconds how the SPU2's samples came (the longest wait between batches) and what the device made of them (ran out, dropped, fewest buffers queued); the device played unheard; once a second the voices sounding, their volumes fixed or sweeping, the main volumes; the reverb left out |
 | `--watch-write ADDR` | every store to a guest address, with the function making it and four of its callers |
@@ -327,7 +327,12 @@ every pair of either run compiled (428 million and 2.46 billion). The car
 select 32 s to 24 s on the same build (`--vu-interpret` for the
 comparison); the race script about 2 minutes.
 
-### Native blocks (the default; `--vu-exact` turns them off)
+### Native blocks (not made at present)
+
+Off in `vurecomp.py` (`NATIVE = False`): they predate the clamped operands
+and the flags held in a block's locals, and differ from the exact blocks
+since (VuNativeIsTheExact). What follows is how they were, and what they
+gave then.
 
 `engine/tools/vunative.py` compiles each block a second time, with the
 pipeline worked out as the code is generated: issue times are a base and an
