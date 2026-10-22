@@ -455,6 +455,29 @@ def fuse_flags(lines: list) -> list:
     return ["C::Fmac<%s, %d>(%s" % (", ".join(params), mode, args)]
 
 
+def mac_only(lines: list) -> list:
+    """The upper's flags as a fast block of a program that never reads
+    STATUS sets them: MAC alone (Fmac's SetFlags 3, MacFlags), STATUS's
+    sticky bits not at all."""
+    out = []
+    for line in lines:
+        if line.startswith("C::StickyFlags<"):
+            continue
+        if line.startswith("C::Flags<"):
+            line = "C::MacFlags<" + line[len("C::Flags<"):]
+        elif line.startswith("C::Fmac<"):
+            head, args = line.split(">(", 1)
+            params = head[len("C::Fmac<"):].split(", ")
+            if len(params) == 6:
+                if params[5] == "2":
+                    params = params[:5]
+                elif params[5] == "1":
+                    params[5] = "3"
+                line = "C::Fmac<%s>(%s" % (", ".join(params), args)
+        out.append(line)
+    return out
+
+
 # The lower operations that hold a vector register write back to the pair's
 # end, and where their arguments name it: (index of `it`, index of `dest`)
 # counted from the end of the argument list.
@@ -488,13 +511,104 @@ def needless_wait(r: int, lane: int, index: int, written: dict) -> bool:
     return index - j >= 4 if j is not None else index >= 3
 
 
+class Flags:
+    """A block's flags as the generator follows them. A pair that sets MAC
+    (and STATUS) or CLIP does not queue them (FinishUpper's flag queue, a
+    dozen stores and a loop to land them): it keeps them in locals, held -
+    in flight - until the generator knows they have landed. A pair takes a
+    cycle at least, and exactly one where it cannot stall (no Wait: `stalls`
+    has those that can), so a reader at pair i knows pair j's flags landed
+    (c_i >= c_j + 4) when i - j >= 4, and not when i - j < 4 with no stall
+    in between; then it lands them itself (Land Mac/Clip, after what is
+    still queued: older, so landed too) and reads them straight, the queue
+    known empty. Where it cannot know, or as the block leaves, the held ones
+    are queued as FinishUpper would have (QueueFlags) - those certain to
+    have landed by then landed instead, as Issue would land them anyway.
+    `held`: [(pair, 'mac' | 'clip')], in order; every one is newer than
+    anything queued."""
+
+    def __init__(self):
+        self.held = []
+        self.empty = False          # the queue known empty
+        self.stalls = set()
+        self.declared = []
+
+    def landed(self, j: int, i: int):
+        """Whether pair j's flags have landed by pair i's issue: True, False
+        or None (not known: a stall between)."""
+        if i - j >= 4:
+            return True
+        if any(k in self.stalls for k in range(j + 1, i + 1)):
+            return None
+        return False
+
+    def land(self, entries: list) -> list:
+        """Lines landing `entries` (a prefix of held, in order)."""
+        lines = []
+        if not entries:
+            return lines
+        if not self.empty:
+            lines.append("C::LandAllFlags(v);")
+        macs = [j for j, kind in entries if kind == "mac"]
+        clips = [j for j, kind in entries if kind == "clip"]
+        if macs:
+            sticky = "".join(" | (fs%d & 0xC0u)" % j for j in macs[:-1])
+            lines.append("C::LandMac(v, fm%d, fs%d%s);" % (macs[-1], macs[-1], sticky))
+        if clips:
+            lines.append("C::LandClip(v, fl%d);" % clips[-1])
+        return lines
+
+    @staticmethod
+    def queue(entries: list) -> list:
+        return ["C::QueueFlags(v, fc%d, fm%d, fs%d, 0u, true, false);" % (j, j, j) if kind == "mac" else
+                "C::QueueFlags(v, fc%d, 0u, 0u, fl%d, false, true);" % (j, j) for j, kind in entries]
+
+    def before_reader(self, i: int) -> list:
+        """At a reader in pair i: the held flags landed by now landed, or all
+        of them queued if it cannot tell. Changes what is held."""
+        states = [self.landed(j, i) for j, _ in self.held]
+        if None in states:
+            lines = self.queue(self.held)
+            self.held = []
+            self.empty = False
+            return lines
+        count = states.count(True)                  # a prefix: later pairs land later
+        lines = self.land(self.held[:count])
+        if count:
+            self.empty = True
+        self.held = self.held[count:]
+        return lines
+
+    def leaving(self, i: int, quiet: bool = False) -> str:
+        """As the block leaves after pair i (its cycle then c_i + 1): those
+        landed by then (i - j >= 3) landed, the rest queued - or all landed
+        where it goes on into a block that is `quiet`: one that reads no
+        flags in its first three pairs, nor leaves before them, so that
+        anything read after has landed (held flags land by c_i + 4, and its
+        third pair issues at c_i + 3 at the earliest), as Issue would have
+        landed them on the way. Changes nothing: the block goes on where it
+        does not leave."""
+        certain = [(j, kind) for j, kind in self.held if quiet or i - j >= 3]
+        rest = self.held[len(certain):]
+        return " ".join(self.land(certain) + self.queue(rest))
+
+
 # How a block leaves: its locals back where the driver and the Vu keep them.
 LEAVE = "s.count = count; s.stopping = stopping; s.delayed = delayed; C::Cycle(v) = cyc; return;"
 
 
+def leave_to(pc: int, chain: dict) -> str:
+    """LEAVE where the run goes on at `pc`, a pair the generator knows: into
+    that block (PS2HOST_VU_NEXT) if the program has one starting there."""
+    if chain and pc in chain:
+        return LEAVE[:-len("return;")] + "PS2HOST_VU_NEXT(%s);" % chain[pc]
+    return LEAVE
+
+
 def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int = 0,
               written: dict = None, clean: dict = None, dead_flags: bool = False,
-              after: tuple = None, no_flags: bool = False) -> list:
+              after: tuple = None, no_flags: bool = False, chain: dict = None, fl: Flags = None,
+              quiet: set = frozenset(), no_status: bool = False) -> list:
     """One pair, as Run runs it, then where the run goes: on to the next pair
     of the block, or (`last`, a branch taken, the program's end) back to the
     driver with s.pc. `index` is its place in the block and `written` where
@@ -505,7 +619,8 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
     `stopping` and `delayed` can be set only by the pair before - and are
     checked only after one that may set them. `no_flags`: the fast blocks
     of a program that never reads MAC or STATUS (fast_eligible) - an FMAC
-    leaves both alone (CLIP is as ever)."""
+    leaves both alone (CLIP is as ever). `no_status`: the fast blocks of a
+    program that never reads STATUS - an FMAC sets MAC alone (mac_only)."""
     if written is None:
         written = {}
     immediate = bool(upper & 0x80000000)
@@ -520,6 +635,8 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
                 waits.append((r, lane))
     q_waits = not immediate and (is_divide(lower) or is_wait(lower, 0x3B))
     p_waits = not immediate and (is_efu(lower) or is_wait(lower, 0x7B))
+    if (waits or q_waits or p_waits) and fl is not None:
+        fl.stalls.add(index)
     if waits or q_waits or p_waits:
         body.append("u64 t = cyc;")
         body += ["C::Wait(t, v, %d, %d);" % w for w in waits]
@@ -545,6 +662,19 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
         upper_lines = [line.replace("C::Flags<", "C::StickyFlags<") for line in upper_lines]
         set_flags = False
     upper_lines = fuse_flags(upper_lines)
+    if no_status:
+        upper_lines = mac_only(upper_lines)
+    if fl is not None and any(name in line for line in lower_lines
+                              for name in ("C::Mac(v, cyc)", "C::Clip(v, cyc)", "C::Status(v, cyc)")):
+        # A flag reader: what it reads landed first (Flags), and straight
+        # from the Vu where the queue is known empty.
+        at = len(body) - len(lower_lines)
+        body[at:at] = fl.before_reader(index)
+        if fl.empty:
+            for k in range(len(body) - len(lower_lines), len(body)):
+                body[k] = (body[k].replace("C::Mac(v, cyc)", "C::MacNow(v)")
+                           .replace("C::Clip(v, cyc)", "C::ClipNow(v)")
+                           .replace("C::Status(v, cyc)", "C::StatusNow(v)"))
     body += upper_lines
     # Q and P land at a pair's issue only where it can tell: a pair that
     # reads Q (an FMAC's Q operand) or P (MFP), starts a DIV or an EFU op
@@ -578,6 +708,18 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
         body.append("v.regs.vc[lifted::kRegI] = 0x%08Xu;" % lower)
     sets_mac = "true" if (upper & 0x7FF) != 0x1FF else "false"
     sets_clip = "true" if (upper & 0x7FF) == 0x1FF else "false"
+    if set_flags and fl is not None:
+        # Held, not queued (Flags): the pair's flags as FinishUpper takes them.
+        kind = "mac" if sets_mac == "true" else "clip"
+        if kind == "mac":
+            body.append("fm%d = C::MacLatest(v); fs%d = %s; fc%d = cyc;"
+                        % (index, index, "0u" if no_status else "C::StatusLatest(v)", index))
+            fl.declared.append("u32 fm%d, fs%d; u64 fc%d;" % (index, index, index))
+        else:
+            body.append("fl%d = C::ClipLatest(v); fc%d = cyc;" % (index, index))
+            fl.declared.append("u32 fl%d; u64 fc%d;" % (index, index))
+        fl.held.append((index, kind))
+        set_flags = False
     flags = "true" if set_flags else "false"
     # VI0 back to 0 (End) after a block's first pair (a run may start with
     # it otherwise) and after macro mode's COP2 operations, which may write
@@ -593,20 +735,36 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
         body.append("C::End(v, cyc);" if vi0 else "C::Next(cyc);")
     next_pc = (pc + 8) & mask
     body.append("++count;")
+    leaving = fl.leaving(index) + " " if fl is not None and fl.held else ""
+    # Going on into a quiet block with nothing pending (no E bit here, no
+    # branch to follow): the held flags all landed (Flags.leaving).
+    calm = not end and not branch
+    landing_into = lambda to: (fl.leaving(index, to in quiet and calm and to in (chain or {})) + " "
+                               if fl is not None and fl.held else "")
     may_stop = after is None or bool(after[1] & 0x40000000)
     may_branch = after is None or is_branch(*after)[0]
     if may_stop:
-        body.append("if (stopping) { s.pc = 0x%Xu; s.done = true; %s }" % (next_pc, LEAVE))
+        body.append("if (stopping) { s.pc = 0x%Xu; s.done = true; %s%s }" % (next_pc, leaving, LEAVE))
     if end:
         body.append("stopping = true;")
     new_delayed = "branch" if branch else "kNone"
     if may_branch:
-        body.append("if (delayed != kNone) { s.pc = delayed; delayed = %s; %s }" % (new_delayed, LEAVE))
+        # After a branch of the block with a target of its own, delayed is
+        # that target if it is set at all.
+        static = after is not None and is_branch(*after)[1] == "static"
+        target = (pc - 8 + 8 + imm11(after[0]) * 8) & mask if static else None
+        if target is not None:
+            body.append("if (delayed != kNone) { s.pc = 0x%Xu; delayed = %s; %s%s }" %
+                        (target, new_delayed, landing_into(target), leave_to(target, chain)))
+        else:
+            body.append("if (delayed != kNone) { s.pc = delayed; delayed = %s; %s%s }" % (new_delayed, leaving, LEAVE))
     if branch:
         body.append("delayed = branch;")
     if last:
         body.append("s.pc = 0x%Xu;" % next_pc)
-        body.append(LEAVE)
+        if leaving:
+            body.append(landing_into(next_pc).strip())
+        body.append(leave_to(next_pc, chain))
     out += ["        " + line for line in body]
     out.append("    }")
     return out
@@ -625,18 +783,25 @@ def is_branch(lower: int, upper: int):
 
 def blocks_of(pairs: dict, entries: list, mask: int) -> list:
     """The program as blocks - [[pc, ...], ...] - each entered at its first
-    pair only: where runs start, branch targets, the pair after a branch's
-    delay slot, the start of each run of code. A block ends at a delay slot,
-    at the pair after an E bit and where code or a leader breaks it."""
+    pair only: where runs start, branch targets, the pair after an
+    unconditional branch's delay slot (a return's place), the start of each
+    run of code. A block ends at an unconditional branch's delay slot, at the
+    pair after an E bit and where code or a leader breaks it. A conditional
+    branch does not end it: the block goes on where it is not taken, and
+    leaves after the delay slot where it is (a side exit) - so what the
+    generator knows (the fields written, the clean registers, the flags
+    held) goes on with it, where a block of its own started knowing
+    nothing: the race's clipping loops were blocks of two and three pairs."""
     leaders = set(e for e in entries if e in pairs)
     for pc, (lower, upper) in pairs.items():
-        branch, static, _ = is_branch(lower, upper)
+        branch, static, conditional = is_branch(lower, upper)
         if branch:
             if static:
                 target = (pc + 8 + imm11(lower) * 8) & mask
                 if target in pairs:
                     leaders.add(target)
-            leaders.add((pc + 16) & mask)
+            if not conditional:
+                leaders.add((pc + 16) & mask)
         if upper & 0x40000000:
             leaders.add((pc + 16) & mask)
     blocks = []
@@ -648,7 +813,8 @@ def blocks_of(pairs: dict, entries: list, mask: int) -> list:
         blocks[-1].append(pc)
         lower, upper = pairs[pc]
         before = pairs.get((pc - 8) & mask)
-        ends_block = bool(before and (is_branch(*before)[0] or before[1] & 0x40000000))
+        ends_block = bool(before and ((is_branch(*before)[0] and not is_branch(*before)[2]) or
+                                      before[1] & 0x40000000))
         previous = pc
     return blocks
 
@@ -673,15 +839,19 @@ def dead_flags(block: list, pairs: dict) -> set:
     issues, and a pair takes one cycle at least, so from j + 4 on - and
     after the block, whatever comes next - the landed flags are j's or
     later ones; before that a reader might see i's. The block runs whole
-    (it does not start where it could not: emit_block), so j does run.
-    STATUS's sticky bits are still gathered."""
+    (it does not start where it could not: emit_block) but for its side
+    exits (a conditional branch taken, after its delay slot k): none may
+    come from i to three pairs after j - before j, j does not run; after
+    j, its flags may not have landed. STATUS's sticky bits are still
+    gathered."""
     n = len(block)
+    exits = [k for k in range(1, n) if is_branch(*pairs[block[k - 1]])[0]]
     dead = set()
     for i in range(n):
         if not sets_mac(pairs[block[i]][1]):
             continue
         j = next((j for j in range(i + 1, n) if sets_mac(pairs[block[j]][1])), None)
-        if j is None or j >= n - 3:
+        if j is None or j >= n - 3 or any(i <= k < j + 3 for k in exits):
             continue
         if not any(reads_mac(*pairs[block[k]]) for k in range(i + 1, j + 4)):
             dead.add(i)
@@ -780,7 +950,24 @@ def fast_drops(unit: int, pairs: dict, mask: int) -> set:
     return {pc for pc, (lower, upper) in pairs.items() if sets_mac(upper) and not mac_live(pairs, mask, pc)}
 
 
-def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = frozenset()) -> list:
+def reads_flags(lower: int, upper: int) -> bool:
+    """FCEQ ... FCGET, FSEQ ... FSOR, FMEQ ... FMOR: the lowers that read or
+    set the landed flags."""
+    return not (upper & 0x80000000) and 0x10 <= (lower >> 25) <= 0x1C
+
+
+def quiet_blocks(blocks: list, pairs: dict) -> set:
+    """The blocks (by start) that read no landed flags in their first three
+    pairs and run them all: three pairs or more, no branch first (a block
+    leaves after its first pair with an E bit or a branch pending - which
+    Flags.leaving's caller rules out - after a branch's delay slot, or
+    after its last)."""
+    return {b[0] for b in blocks if len(b) >= 3 and not is_branch(*pairs[b[0]])[0] and
+            not any(reads_flags(*pairs[pc]) for pc in b[:3])}
+
+
+def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = frozenset(),
+               chain: dict = None, quiet: set = frozenset(), no_status: bool = False) -> list:
     # The run's state and the cycle as locals, written back where the block
     # leaves (LEAVE): nothing the block does can reach them through memory.
     # A block starts only with as many pairs left to the limit as it has
@@ -789,18 +976,27 @@ def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = froz
     # (a delay slot or the pair after an E bit that begins a block) ends it
     # after its first pair - so from its second pair on it runs whole, which
     # dead_flags relies on; the first pair's flags are never left out.
-    out = ["void %s(Vu& v, VuRunState& s, std::uint64_t limit) {" % name,
+    # `chain`: the program's blocks of the same kind by where they start, for
+    # going straight on into the next (leave_to).
+    out = ["PS2HOST_VU_BLOCK void %s(Vu& v, VuRunState& s, std::uint64_t limit) {" % name,
            "    if (s.count + %d > limit) return;" % len(block),
            "    u64 count = s.count, cyc = C::Cycle(v);",
            "    bool stopping = s.stopping;",
            "    u32 delayed = s.delayed;"]
     written, clean = {}, {}
     dead = dead_flags(block, pairs) - {0}
+    fl = Flags()
+    head = len(out)
     for i, pc in enumerate(block):
         out += emit_pair(pc, pairs[pc][0], pairs[pc][1], mask, i == len(block) - 1, i, written, clean,
-                         i in dead, pairs[block[i - 1]] if i else None, pc in drops)
+                         i in dead, pairs[block[i - 1]] if i else None, pc in drops, chain, fl, quiet,
+                         no_status)
+    out[head:head] = ["    " + line for line in fl.declared]
     out.append("}")
-    return out
+    # The blocks it goes on into, declared before it (they may be in another file).
+    called = sorted(set(line.split("PS2HOST_VU_NEXT(")[1].split(")")[0]
+                        for line in out if "PS2HOST_VU_NEXT(" in line))
+    return ["PS2HOST_VU_BLOCK void %s(Vu& v, VuRunState& s, std::uint64_t limit);" % c for c in called] + out
 
 
 def runs_of(pairs: dict) -> list:
@@ -856,6 +1052,11 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
     names one file for everything (the tests' corpus); otherwise the blocks go
     in vu_blocks_N.cpp and the tables in vu_programs.cpp."""
     import vunative     # (here: it imports this module)
+    # Native blocks (vunative.py) are not made: they predate the clamped
+    # operands and the flags held in a block's locals, and differ from the
+    # exact blocks since (the host test VuNativeIsTheExact). The tables still
+    # take them, the exact blocks standing in.
+    NATIVE = False
     files = {}
     chunks = [[]]
     tables = []
@@ -869,17 +1070,22 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
         names = []
         natives = []
         drops = fast_drops(unit, pairs, mask)
-        fast = bool(drops)
+        # A fast variant wherever STATUS is never read: its MAC left out where
+        # no one sees it (drops), its STATUS everywhere (no_status).
+        fast = drops is not None
+        quiet = quiet_blocks(blocks, pairs)
         for block in blocks:
             block_name = "%sBlock%04X" % (name, block[0])
             names.append((block[0], block_name))
             for variant, dropped in [("", frozenset())] + ([("Fast", drops)] if fast else []):
-                code = emit_block(block_name + variant, block, pairs, mask, dropped)
+                chain = {b[0]: "%sBlock%04X%s" % (name, b[0], variant) for b in blocks}
+                code = emit_block(block_name + variant, block, pairs, mask, dropped, chain, quiet,
+                                  no_status=variant == "Fast")
                 if single is None and len(chunks[-1]) + len(code) > LINES_PER_FILE and chunks[-1]:
                     chunks.append([])
                 chunks[-1] += code + [""]
-                declarations.append("void %s%s(Vu& v, VuRunState& s, std::uint64_t limit);" % (block_name, variant))
-            code = vunative.emit_native(block_name + "Native", block_name, block, pairs, mask)
+                declarations.append("PS2HOST_VU_BLOCK void %s%s(Vu& v, VuRunState& s, std::uint64_t limit);" % (block_name, variant))
+            code = vunative.emit_native(block_name + "Native", block_name, block, pairs, mask) if NATIVE else None
             if code is None:
                 natives.append(block_name)
                 continue
@@ -890,7 +1096,7 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
             if single is None and len(chunks[-1]) + len(code) > LINES_PER_FILE and chunks[-1]:
                 chunks.append([])
             chunks[-1] += code + [""]
-            declarations.append("void %sNative(Vu& v, VuRunState& s, std::uint64_t limit);" % block_name)
+            declarations.append("PS2HOST_VU_BLOCK void %sNative(Vu& v, VuRunState& s, std::uint64_t limit);" % block_name)
         tables.append("const u32 k%sCode[] = {" % name)
         tables.append(code_array(runs_of(pairs)))
         tables.append("};")
@@ -912,7 +1118,7 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
                                   "k%sFastBlocks" % name if fast else "nullptr", name))
     main = [HEADER % what]
     if single is not None:
-        main += chunks[0]
+        main += declarations + [""] + chunks[0]
     else:
         main += declarations + [""]
     main += tables

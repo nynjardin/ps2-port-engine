@@ -63,8 +63,23 @@ std::atomic<u64> g_frame{0};
 std::mutex g_frames_mutex;
 struct Picture { u64 due, shown; bool dropped; };
 std::vector<u64> g_blanks;                      // when each frame began (Frame)
+std::vector<u64> g_blank_cpu;                   // the process's CPU time then (ns)
 std::vector<u64> g_lost;                        // when a blank was lost
 std::vector<Picture> g_pictures;
+
+/* The CPU time every thread of the process has had (ns): over a stall, how
+   many cores the process kept busy - all it was given (its own work), or few
+   (something outside held the cores). */
+u64 ProcessCpuNs() {
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+    return ((u64(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
+            (u64(user.dwHighDateTime) << 32 | user.dwLowDateTime)) * 100;
+#else
+    return 0;
+#endif
+}
 
 Lane& ThisLane() {
     thread_local Lane* lane = nullptr;
@@ -95,7 +110,7 @@ struct Named {
 #ifdef _WIN32
     HANDLE handle = nullptr;
 #endif
-    u64 last_cpu_100ns = 0;
+    u64 last_cpu_100ns = 0, last_kernel_100ns = 0;
 };
 std::mutex g_named_mutex;
 std::vector<Named> g_named;
@@ -114,12 +129,21 @@ std::string ThreadCpu() {
         if (!GetThreadTimes(n.handle, &created, &exited, &kernel, &user)) continue;
         const u64 cpu = (u64(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
                         (u64(user.dwHighDateTime) << 32 | user.dwLowDateTime);
-        const u64 used = cpu - n.last_cpu_100ns;
+        const u64 in_kernel = u64(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime;
+        const u64 used = cpu - n.last_cpu_100ns, used_kernel = in_kernel - n.last_kernel_100ns;
         n.last_cpu_100ns = cpu;
+        n.last_kernel_100ns = in_kernel;
         if (seconds <= 0) continue;
-        char one[96];
-        std::snprintf(one, sizeof one, "%s%s %d%%", out.empty() ? "" : ", ", n.name.c_str(),
-                      int(100.0 * double(used) / 1e7 / seconds + 0.5));
+        // PS2HOST_CPU_KERNEL=1: the kernel's part of each as well (waits, wakes).
+        static const bool kernel_too = std::getenv("PS2HOST_CPU_KERNEL") != nullptr;
+        char one[128];
+        if (kernel_too)
+            std::snprintf(one, sizeof one, "%s%s %d%% (kernel %d%%)", out.empty() ? "" : ", ", n.name.c_str(),
+                          int(100.0 * double(used) / 1e7 / seconds + 0.5),
+                          int(100.0 * double(used_kernel) / 1e7 / seconds + 0.5));
+        else
+            std::snprintf(one, sizeof one, "%s%s %d%%", out.empty() ? "" : ", ", n.name.c_str(),
+                          int(100.0 * double(used) / 1e7 / seconds + 0.5));
         out += one;
     }
 #endif
@@ -173,8 +197,10 @@ void Frame(u64 frame) {
     if (!On()) return;
     const u64 now = Now();
     Instant("frame", now, frame);
+    const u64 cpu = ProcessCpuNs();
     std::lock_guard<std::mutex> hold(g_frames_mutex);
     g_blanks.push_back(now);
+    g_blank_cpu.push_back(cpu);
 }
 
 void BlankLost() {
@@ -288,18 +314,37 @@ void Finish() {
     const double nominal = at(0.5);
     std::fprintf(stderr, "interval: median %.2f ms, 95%% %.2f, 99%% %.2f, 99.9%% %.2f, longest %.2f\n", nominal, at(0.95),
                  at(0.99), at(0.999), sorted.back());
+    // Each interval judged by the blanks of its moment (the last eight's
+    // median): a game whose blanks change rate - 144 a second in play, 60 in
+    // its cutscenes and menus - is late by its own, not by the run's median
+    // (every cutscene picture counted late at 144). A loading screen's blanks
+    // run faster than any screen (SetFastForward): not judged.
+    const std::vector<u64>& times = shown.size() > 1 ? shown : g_blanks;
+    const auto period = [&](std::size_t i) {
+        const auto end = std::upper_bound(g_blanks.begin(), g_blanks.end(), times[i + 1]);
+        const std::size_t b = std::size_t(end - g_blanks.begin());
+        if (b < 3) return nominal;
+        double gaps[8];
+        std::size_t n = 0;
+        for (std::size_t k = b - 1; k > 0 && n < 8; --k) gaps[n++] = double(g_blanks[k] - g_blanks[k - 1]) / 1e6;
+        std::sort(gaps, gaps + n);
+        return gaps[n / 2];
+    };
+    const auto late_at = [&](std::size_t i) {
+        const double own = period(i);
+        return own > 4.0 && intervals[i] > own * 1.5;
+    };
     unsigned late = 0, repeats = 0;
-    for (double ms : intervals)
-        if (ms > nominal * 1.5) {
+    for (std::size_t i = 0; i < intervals.size(); ++i)
+        if (late_at(i)) {
             ++late;
-            repeats += unsigned(ms / nominal + 0.5) - 1;
+            repeats += unsigned(intervals[i] / period(i) + 0.5) - 1;
         }
     std::fprintf(stderr, "frames shown late: %u (%u frames' time the picture repeated)\n", late, repeats);
     // The worst: what was busy in the frame before each.
-    const std::vector<u64>& times = shown.size() > 1 ? shown : g_blanks;
     std::vector<std::size_t> worst;
     for (std::size_t i = 0; i < intervals.size(); ++i)
-        if (intervals[i] > nominal * 1.5) worst.push_back(i);
+        if (late_at(i)) worst.push_back(i);
     std::sort(worst.begin(), worst.end(), [&](std::size_t a, std::size_t b) { return intervals[a] > intervals[b]; });
     if (worst.size() > 12) worst.resize(12);
     for (std::size_t i : worst) {
@@ -309,6 +354,14 @@ void Finish() {
         for (const auto& [what, ms] : BusyIn(from, to)) {
             if (n++ == 5) break;
             std::fprintf(stderr, " %s %.1f ms;", what.c_str(), ms);
+        }
+        // The process's CPU over the blanks around it, in cores.
+        const auto first = std::upper_bound(g_blanks.begin(), g_blanks.end(), from);
+        const auto last = std::lower_bound(g_blanks.begin(), g_blanks.end(), to);
+        if (first != g_blanks.begin() && last != g_blanks.end()) {
+            const std::size_t a = std::size_t(first - g_blanks.begin()) - 1, b = std::size_t(last - g_blanks.begin());
+            if (b < g_blank_cpu.size() && g_blank_cpu[b] > g_blank_cpu[a])
+                std::fprintf(stderr, " process: %.2f cores", double(g_blank_cpu[b] - g_blank_cpu[a]) / double(g_blanks[b] - g_blanks[a]));
         }
         std::fprintf(stderr, "\n");
     }

@@ -160,6 +160,28 @@ struct GsClutLoad {
     std::uint32_t texa_lo = 0, ta1 = 0;
 };
 
+/* A channel shuffle: a sprite drawn into a 16-bit view (VIEW_PSM) of a
+   32-bit colour target, its texels a 16-bit view (TEX_PSM, Z16 or Z16S) of a
+   depth buffer, copied 1:1 (the texel the pixel plus (du, dv)) - each 16-bit
+   pixel a half of a 32-bit word (Burnout 3's fog: the depth's bits 8-15 into
+   the picture's alpha). ChannelShuffle does it on the 32-bit target itself,
+   as the GS would through memory: the bits WRITE16 of each 16-bit pixel the
+   sprite covers (FRAME's mask), from its texel as the GS expands it (TEXA,
+   AEM; FBA sets the alpha bit). The target and the depth buffer are named as
+   they were made (FBP, FBW, CT32; ZBP and the size it was made at); the view
+   can start further into the target (VIEW_FBP: Burnout 3's player 2, 224
+   rows down), the texture further into the depth buffer (TBP). */
+struct GsShuffle {
+    std::uint32_t fbp = 0, fbw = 1, view_fbp = 0, view_psm = 0;
+    std::int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;        /* the sprite in the view, ends exclusive */
+    std::int32_t du = 0, dv = 0;
+    std::uint32_t tbp = 0, tbw = 1, tex_psm = 0;        /* TEX0: TBP in blocks */
+    std::uint32_t zbp = 0, zwidth = 0, zheight = 0;
+    std::uint32_t write16 = 0;
+    std::uint32_t ta0 = 0, ta1 = 0x80;
+    bool aem = false, fba = false;
+};
+
 class GsRenderer {
 public:
     virtual ~GsRenderer() = default;
@@ -207,6 +229,12 @@ public:
     virtual bool HasTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm) const = 0;
     /* Triangles, three vertices each, in GS order. */
     virtual void DrawTriangles(const GsDrawState& state, const GsVertex* vertices, std::size_t count) = 0;
+    /* The same, where the caller knows `state` is the last DrawTriangles'
+       (or DrawTrianglesAgain's) but for `gouraud`: a renderer that compares
+       each draw's state with the last may take less care. */
+    virtual void DrawTrianglesAgain(const GsDrawState& state, const GsVertex* vertices, std::size_t count) {
+        DrawTriangles(state, vertices, count);
+    }
     /* Runs what has been drawn. */
     virtual void Flush() = 0;
     /* Hands what has been recorded to the GPU without waiting for it (once a
@@ -225,11 +253,11 @@ public:
        what is recorded, nothing waiting: part of a block written over what
        the GPU drew there, without bringing it back. */
     virtual void MemoryPatch(const std::uint32_t* words, std::size_t count) { (void)words, (void)count; }
-    /* A target's rows [first_row, rows), `cols` wide, into GPU memory at FBP
-       as its PSM lays them out (CT32, CT24, CT16, CT16S); false if there is
-       none. */
+    /* A target's rows [first_row, rows), columns [first_col, cols), into GPU
+       memory at FBP as its PSM lays them out (CT32, CT24, CT16, CT16S); false
+       if there is none. */
     virtual bool TargetToMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t cols,
-                                std::uint32_t rows, std::uint32_t first_row = 0) = 0;
+                                std::uint32_t rows, std::uint32_t first_row = 0, std::uint32_t first_col = 0) = 0;
     /* A target, made at this size if there is none, loaded from GPU memory. */
     virtual void TargetFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t width,
                                   std::uint32_t height) = 0;
@@ -237,7 +265,7 @@ public:
        (Z32, Z24, Z16, Z16S) FBW pages wide. */
     virtual bool DepthToMemory(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::uint32_t fbw,
                                std::uint32_t zpsm, std::uint32_t cols, std::uint32_t rows,
-                               std::uint32_t first_row = 0) = 0;
+                               std::uint32_t first_row = 0, std::uint32_t first_col = 0) = 0;
     virtual void DepthFromMemory(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::uint32_t fbw,
                                  std::uint32_t zpsm) = 0;
     /* A texture decoded from GPU memory, as the host's software GS decodes
@@ -250,6 +278,10 @@ public:
     /* Rows of the GPU's CLUT (16 entries each; bit r of `rows` for row r)
        from the host's copy, `clut` being all 256 entries. */
     virtual void ClutRows(const std::uint32_t* clut, std::uint32_t rows) = 0;
+    /* GsShuffle, on the target's image (and nothing in memory): false when
+       this renderer cannot, the draw then made as it is. */
+    virtual bool CanShuffle() const { return false; }
+    virtual void ChannelShuffle(const GsShuffle& shuffle) { (void)shuffle; }
     /* A depth buffer's Z (the GS's, unsigned), rows top-down; false if there
        is none of that size. */
     virtual bool ReadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height,
@@ -270,10 +302,12 @@ public:
        memory's, as ever. */
     virtual void ReloadKeepsColour(bool keep) { (void)keep; }
     /* TargetFromMemory / DepthFromMemory for rows [first_row, first_row +
-       rows) alone (the rest of the image as it is). */
+       rows) alone (the rest of the image as it is) - of a target, columns
+       [first_col, end_col) of them. */
     virtual void TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t width,
-                                      std::uint32_t height, std::uint32_t first_row, std::uint32_t rows) {
-        (void)first_row, (void)rows;
+                                      std::uint32_t height, std::uint32_t first_row, std::uint32_t rows,
+                                      std::uint32_t first_col = 0, std::uint32_t end_col = ~0u) {
+        (void)first_row, (void)rows, (void)first_col, (void)end_col;
         TargetFromMemory(fbp, fbw, psm, width, height);
     }
     virtual void DepthRowsFromMemory(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::uint32_t fbw,

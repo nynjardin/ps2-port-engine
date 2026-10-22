@@ -121,6 +121,15 @@ public:
         return std::uint32_t(h > 0 ? h : 0);
     }
     bool Vsync() const override { return vsync_; }
+    float RefreshRate() const override { return refresh_hz_.load(std::memory_order_relaxed); }
+    void SetKeepRefresh(bool keep) override {
+        if (keep_refresh_ == keep) return;
+        keep_refresh_ = keep;
+        if (Fullscreen()) SetFullscreen(true);
+    }
+    bool keep_refresh_ = false;         // SetKeepRefresh's
+    std::atomic<float> refresh_hz_{0.0f};       // Pump's
+    unsigned refresh_looks_ = 0;
     Pacing TakePacing() override;
     bool Focused() const override;
     bool KeyDown(int scancode) const override;
@@ -1636,11 +1645,15 @@ const SDL_DisplayMode* EvenMode(SDL_Window* window) {
 void VulkanDisplay::SetFullscreen(bool on) {
     if (!window_) return;
     if (on) {
-        const SDL_DisplayMode* mode = EvenMode(window_);
+        const SDL_DisplayMode* mode = keep_refresh_ ? nullptr : EvenMode(window_);
         SDL_SetWindowFullscreenMode(window_, mode);
         if (mode)
             std::fprintf(stderr, "[display] fullscreen at %dx%d, %.2f Hz\n", mode->w, mode->h,
                          double(mode->refresh_rate));
+        else if (keep_refresh_)
+            if (const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window_)))
+                std::fprintf(stderr, "[display] fullscreen at the screen's own %.2f Hz (frame rate DISPLAY)\n",
+                             double(desktop->refresh_rate));
     }
     SDL_SetWindowFullscreen(window_, on);
     fullscreen_cursor_stale_ = true;        // the system's pointer: hidden in fullscreen (UpdateCursor)
@@ -1658,6 +1671,14 @@ bool VulkanDisplay::Pump() {
         std::lock_guard<std::mutex> hold(title_lock_);
         if (title_changed_ && window_) SDL_SetWindowTitle(window_, title_.c_str());
         title_changed_ = false;
+    }
+    // The screen's refresh, for RefreshRate on other threads: looked at
+    // again every hundred pumps (the window moved to another screen, a
+    // fullscreen mode taken).
+    if (window_ && refresh_looks_++ % 100 == 0) {
+        const SDL_DisplayID id = SDL_GetDisplayForWindow(window_);
+        const SDL_DisplayMode* mode = id ? SDL_GetCurrentDisplayMode(id) : nullptr;
+        refresh_hz_.store(mode ? mode->refresh_rate : 0.0f, std::memory_order_relaxed);
     }
     // Each controller's: the triggers' effects as last set, when they change
     // (off on one SetTriggerTargets leaves out), and the motors as the game

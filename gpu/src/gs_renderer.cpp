@@ -30,6 +30,7 @@
 #include <mutex>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "gpu_internal.h"
 #include "gs_frag.h"
@@ -45,6 +46,7 @@
 #include "decode_comp.h"
 #include "decode_image_comp.h"
 #include "patch_comp.h"
+#include "shuffle_comp.h"
 
 namespace ps2gpu {
 
@@ -173,6 +175,11 @@ struct Texture {
 
 // What the frames' command buffers hold (RendererCounters, PS2HOST_GPU_LOG).
 std::uint64_t g_barriers = 0, g_transitions = 0, g_dispatches = 0, g_draws = 0, g_passes = 0, g_feedback = 0;
+// Why each pass ended (RendererCounters): a draw's destination alpha test,
+// its copy of its own target, a source to make readable, another target,
+// another depth buffer; anything else recorded (VulkanGpu::end_pass).
+enum PassEnd { kEndDate, kEndFeedback, kEndSource, kEndTarget, kEndDepth, kEndOther, kEndWhys };
+std::uint64_t g_pass_ends[kEndWhys] = {};
 
 void Transition(VkCommandBuffer cmd, Image& t, VkImageLayout to, VkAccessFlags dst_access,
                 VkPipelineStageFlags dst_stage) {
@@ -212,6 +219,22 @@ struct SwizzleParams {
     std::uint32_t bp, bw, psm, cols, rows, stride, to_memory, depth, row0;
     std::uint32_t scale = 1;    // the image's pixels to a GS pixel: one taken to memory, a square filled from it
     std::uint32_t keep_colour = 0;  // from memory: the square's colour kept where memory differs in alpha alone
+    std::uint32_t col0 = 0;         // the first column moved (`cols` the end): a write-back of the pages drawn
+};
+
+/* shuffle.comp's push constants (ChannelShuffle). */
+struct ShuffleParams {
+    std::uint32_t dst_bp, dst_bw, dst_view;
+    std::uint32_t view_bp;
+    std::uint32_t rx0, ry0, cols, rows;
+    std::int32_t qx0, qy0, qx1, qy1;
+    std::int32_t period, run;
+    std::int32_t du, dv;
+    std::uint32_t src_bp, src_bw, src_view;
+    std::uint32_t img_bp, img_w, img_h;
+    std::uint32_t write16;
+    std::uint32_t ta0, ta1, flags;
+    std::uint32_t scale;
 };
 
 constexpr std::uint32_t kDepthRows = 512;   // a depth buffer's rows (DrawTriangles; the bridge's)
@@ -257,14 +280,42 @@ bool PartlyMasked(std::uint32_t kept) {
    from a copy of the target. */
 bool Is16Bit(std::uint32_t psm) { return psm == 0x02 || psm == 0x0A || psm == 0x32 || psm == 0x3A; }
 
+/* Dual-source blending (the factor a second output): Blender16 needs it. */
+bool g_dual_source_blend = false;
+
+/* How the blender can make a 16-bit target's blend exactly, the GS's five
+   bits a channel, without the shader reading a copy of the target: where
+   the target counts once (Cd's coefficient 1 - as D, or as A with FIX 0x80,
+   a factor of 1) or not at all. The shader works out the rest, S (gs.frag:
+   the blend with each Cd as 0), and the blender
+     1  writes S (Cd not in it, or it cancels: (Cs - Cd) * 1 + Cd);
+     2  adds S cut to five bits to the target;
+     3  takes away -S, cut up to five bits (D - Cs, as Cd - Cs).
+   The target's values are whole fives, so cutting the sum cuts only what is
+   added; a sum past 255 keeps 255, which every reader of a 16-bit target
+   cuts to the GS's 248. 0: the shader blends. Below Freezing Point's
+   shadows, its characters added into and taken out of a 16-bit buffer: 900
+   copies of it a picture, three quarters of the GPU's time at 3x. */
+int Blender16(const GsDrawState& s) {
+    if (!g_dual_source_blend || !s.blend || !Is16Bit(s.psm) || s.c == BlendAlpha::Dest) return 0;
+    using C = BlendColour;
+    const bool one = s.c == BlendAlpha::Fix && s.fix == 0x80;
+    auto sign = [](C plus, C minus) { return plus == C::Zero && minus == C::Source ? 3 : 2; };
+    if (s.a != C::Dest && s.b != C::Dest) return s.d == C::Dest ? sign(s.a, s.b) : 1;
+    if (!one) return 0;
+    if (s.a == C::Dest && s.b != C::Dest && s.d != C::Dest) return sign(s.d, s.b);     // Cd + D - B
+    if (s.b == C::Dest && s.a != C::Dest && s.d == C::Dest) return 1;                  // A
+    return 0;
+}
+
 bool ShaderBlend(const GsDrawState& s) {
     if (!s.blend) return false;
     // Into a 16-bit target: the blend's result cut to five bits a channel,
     // as the GS stores it (the blender would keep eight: the next blend over
     // it would read more than the GS has - Burnout 3's picture copied into
     // its 16-bit display buffer, blended over the last, came out 9 brighter
-    // in the dark).
-    if (Is16Bit(s.psm)) return true;
+    // in the dark) - unless the blender can (Blender16).
+    if (Is16Bit(s.psm)) return Blender16(s) == 0;
     if (s.a == s.b) return false;
     // The destination's alpha as the factor (C = Ad): over 128 on the GS,
     // over 255 as the blender reads a byte (DST_ALPHA) - at half its strength.
@@ -287,6 +338,15 @@ constexpr std::uint32_t kShaderBlend = 1u << 15;
 std::uint32_t PipelineKey(const GsDrawState& s) {
     const std::uint32_t masked = (~WriteMask(KeptBits(s.fbmsk, s.psm)) & 0xF) << 9;
     if (!s.blend) return masked;
+    if (const int way = Blender16(s)) {
+        // S written, or Cd + S, Cd - |S| (the shader's S, its factor 1): as
+        // the blend Cs * FIX + Cd, or (0 - Cs) * FIX + Cd.
+        if (way == 1) return masked;
+        const BlendColour a = way == 3 ? BlendColour::Zero : BlendColour::Source;
+        const BlendColour b = way == 3 ? BlendColour::Source : BlendColour::Zero;
+        return masked | 1u | std::uint32_t(a) << 1 | std::uint32_t(b) << 3 | std::uint32_t(BlendAlpha::Fix) << 5 |
+               std::uint32_t(BlendColour::Dest) << 7;
+    }
     return masked | 1u | std::uint32_t(s.a) << 1 | std::uint32_t(s.b) << 3 | std::uint32_t(s.c) << 5 |
            std::uint32_t(s.d) << 7 | (ShaderBlend(s) ? kShaderBlend : 0u);
 }
@@ -365,7 +425,12 @@ public:
                        std::uint32_t height) override;
     bool UploadReplacement(std::uint64_t id, std::uint32_t format, std::uint32_t width, std::uint32_t height,
                            std::uint32_t levels, const std::uint8_t* data, std::size_t bytes) override;
-    bool HasReplacement(std::uint64_t id) const override { return replacements_.count(id) != 0; }
+    // (any thread: the threaded renderer asks it each draw without waiting
+    // for its queue - replacements_ is the renderer thread's)
+    bool HasReplacement(std::uint64_t id) const override {
+        std::lock_guard<std::mutex> hold(resident_lock_);
+        return resident_.count(id) != 0;
+    }
     void UseReplacement(std::uint64_t key, std::uint64_t id) override { textures_[key].replacement = id; }
     bool BlockCompression() const override { return g_.bc; }
     void UploadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, const std::uint32_t* z) override;
@@ -385,7 +450,8 @@ public:
         SavePipelineCache();
     }
     void TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t width,
-                              std::uint32_t height, std::uint32_t first_row, std::uint32_t rows) override;
+                              std::uint32_t height, std::uint32_t first_row, std::uint32_t rows, std::uint32_t first_col,
+                              std::uint32_t end_col) override;
     void ReloadKeepsColour(bool keep) override { keep_colour_ = keep; }
     void DepthRowsFromMemory(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::uint32_t fbw,
                              std::uint32_t zpsm, std::uint32_t first_row, std::uint32_t rows) override;
@@ -409,16 +475,19 @@ public:
     void MemoryRead(std::uint32_t begin, std::uint32_t end, std::uint8_t* bytes) override;
     void MemoryPatch(const std::uint32_t* words, std::size_t count) override;
     bool TargetToMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t cols,
-                        std::uint32_t rows, std::uint32_t first_row) override;
+                        std::uint32_t rows, std::uint32_t first_row, std::uint32_t first_col) override;
     void TargetFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t width,
                           std::uint32_t height) override;
     bool DepthToMemory(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::uint32_t fbw,
-                       std::uint32_t zpsm, std::uint32_t cols, std::uint32_t rows, std::uint32_t first_row) override;
+                       std::uint32_t zpsm, std::uint32_t cols, std::uint32_t rows, std::uint32_t first_row,
+                       std::uint32_t first_col) override;
     void DepthFromMemory(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::uint32_t fbw,
                          std::uint32_t zpsm) override;
     void TextureFromMemory(std::uint64_t key, const GsTextureDecode& decode) override;
     void ClutFromMemory(const GsClutLoad& load) override;
     void ClutRows(const std::uint32_t* clut, std::uint32_t rows) override;
+    bool CanShuffle() const override { return shuffle_pipeline_ != VK_NULL_HANDLE; }
+    void ChannelShuffle(const GsShuffle& shuffle) override;
     bool ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::vector<std::uint32_t>* pixels,
                     std::uint32_t* width, std::uint32_t* height) override;
     bool ReadTargetFull(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::vector<std::uint32_t>* pixels,
@@ -538,12 +607,17 @@ private:
        through 64-320-wide views of one memory some fifty times a frame,
        each brought back from memory: at 4x those were a third of the GPU's
        time, and the upscaled glow ghosted (a second, offset outline around
-       its words). */
-    std::uint32_t ScaleOf(std::uint32_t width) const { return width <= 320 ? 1u : scale_; }
+       its words). 1024 wide or more (FBW 16 and up) too: wider than any
+       picture the GS shows, a view of memory as texture pages - Burnout 3's
+       1024x256 over its glow's memory, read as PSMT8H, brought back from
+       memory 18 times a splitscreen frame and never drawn into: at 3x its
+       reloads were a third of the swizzles. */
+    std::uint32_t ScaleOf(std::uint32_t width) const { return width <= 320 || width >= 1024 ? 1u : scale_; }
     Image* open_target_ = nullptr;
     Image* open_depth_ = nullptr;
-    void EndPass(VkCommandBuffer cmd) {
+    void EndPass(VkCommandBuffer cmd, PassEnd why = kEndOther) {
         if (!open_target_) return;
+        ++g_pass_ends[why];
         vkCmdEndRendering(cmd);
         open_target_ = open_depth_ = nullptr;
     }
@@ -588,6 +662,14 @@ private:
        drawn for the longest go when they come to over kReplacementBudget. */
     std::unordered_map<std::uint64_t, Texture> replacements_;
     VkDeviceSize replacement_bytes_ = 0;
+    // Their ids, for HasReplacement from another thread.
+    mutable std::mutex resident_lock_;
+    std::unordered_set<std::uint64_t> resident_;
+    void Resident(std::uint64_t id, bool in) {
+        std::lock_guard<std::mutex> hold(resident_lock_);
+        if (in) resident_.insert(id);
+        else resident_.erase(id);
+    }
     std::uint64_t frame_ = 0;
     static constexpr VkDeviceSize kReplacementBudget = VkDeviceSize(1536) << 20;
     void EvictReplacements();
@@ -711,6 +793,21 @@ private:
     void DepthOut(VkCommandBuffer cmd, const SwizzleParams& params, Image& depth);
     void DepthIn(VkCommandBuffer cmd, const SwizzleParams& params, Image& depth);
     bool MakeDepthPipelines();
+    /* The channel shuffle (shuffle.comp): the target as storage (set 0), the
+       depth buffer sampled (set 1). None if it did not build: shuffles are
+       then drawn as they are. */
+    VkShaderModule shuffle_ = VK_NULL_HANDLE;
+    VkPipelineLayout shuffle_layout_ = VK_NULL_HANDLE;
+    VkPipeline shuffle_pipeline_ = VK_NULL_HANDLE;
+    void MakeShufflePipeline();
+    /* Shuffles one after another, alike but for their columns - a comb of
+       sprites, `run` wide every `period` (Burnout 3's fog: 40, 8 wide every
+       16) - wait to be one dispatch: recorded by the next anything else
+       (Flush, DrawTriangles). */
+    bool shuffle_pending_ = false;
+    GsShuffle shuffle_wait_;
+    std::int32_t shuffle_period_ = 0, shuffle_count_ = 0;
+    void RecordShuffle();
 };
 
 void* VulkanGsRenderer::Vertices(VkDeviceSize bytes, VkBuffer* buffer, VkDeviceSize* offset) {
@@ -942,6 +1039,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
     vert_ = module(spirv_gs_vert, sizeof spirv_gs_vert);
     frag_ = g_.dual_source ? module(spirv_gs_frag, sizeof spirv_gs_frag)
                            : module(spirv_gs_frag_single, sizeof spirv_gs_frag_single);
+    g_dual_source_blend = g_.dual_source;
     frag_blend_ = module(spirv_gs_frag_blend, sizeof spirv_gs_frag_blend);
     if (!vert_ || !frag_ || !frag_blend_) {
         if (error) *error = "the GS shaders did not load";
@@ -1161,6 +1259,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         if (error) *error = "the depth buffer shaders did not load";
         return false;
     }
+    MakeShufflePipeline();
     {
         VkShaderModuleCreateInfo pi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         pi.codeSize = sizeof spirv_patch_comp;
@@ -1225,6 +1324,29 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         MemoryBarrier(cmd);
     });
     return true;
+}
+
+void VulkanGsRenderer::MakeShufflePipeline() {
+    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    ci.codeSize = sizeof spirv_shuffle_comp;
+    ci.pCode = spirv_shuffle_comp;
+    if (vkCreateShaderModule(g_.device, &ci, nullptr, &shuffle_) != VK_SUCCESS) return;
+    const VkDescriptorSetLayout layouts[2] = {image_set_layout_, depth_set_layout_};
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ShuffleParams)};
+    VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    lci.setLayoutCount = 2;
+    lci.pSetLayouts = layouts;
+    lci.pushConstantRangeCount = 1;
+    lci.pPushConstantRanges = &push;
+    if (vkCreatePipelineLayout(g_.device, &lci, nullptr, &shuffle_layout_) != VK_SUCCESS) return;
+    VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = shuffle_;
+    cpi.stage.pName = "main";
+    cpi.layout = shuffle_layout_;
+    if (vkCreateComputePipelines(g_.device, cache_, 1, &cpi, nullptr, &shuffle_pipeline_) != VK_SUCCESS)
+        shuffle_pipeline_ = VK_NULL_HANDLE;
 }
 
 bool VulkanGsRenderer::MakeDepthPipelines() {
@@ -1350,7 +1472,7 @@ void VulkanGsRenderer::DepthOut(VkCommandBuffer cmd, const SwizzleParams& params
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swizzle_depth_layout_, 0, 2, sets, 0, nullptr);
     vkCmdPushConstants(cmd, swizzle_depth_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
     ++g_dispatches;
-    vkCmdDispatch(cmd, (params.cols + 7) / 8, (params.rows + 7) / 8, 1);
+    vkCmdDispatch(cmd, (params.cols - params.col0 + 7) / 8, (params.rows + 7) / 8, 1);
     g_.Mark(cmd, kProfSwizzle);
 }
 
@@ -1436,7 +1558,7 @@ void VulkanGsRenderer::SwizzleImage(VkCommandBuffer cmd, const SwizzleParams& pa
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swizzle_image_layout_, 0, 2, sets, 0, nullptr);
     vkCmdPushConstants(cmd, swizzle_image_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
     ++g_dispatches;
-    vkCmdDispatch(cmd, (params.cols + 7) / 8, (params.rows + 7) / 8, 1);
+    vkCmdDispatch(cmd, (params.cols - params.col0 + 7) / 8, (params.rows + 7) / 8, 1);
     g_.Mark(cmd, kProfSwizzle);
 }
 
@@ -1503,7 +1625,7 @@ void VulkanGsRenderer::MemoryRead(std::uint32_t begin, std::uint32_t end, std::u
 }
 
 bool VulkanGsRenderer::TargetToMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t cols,
-                                      std::uint32_t rows, std::uint32_t first_row) {
+                                      std::uint32_t rows, std::uint32_t first_row, std::uint32_t first_col) {
     // The batch pending first: a target it draws into for the first time is
     // made as it goes (and the answer is the same however far behind a
     // threaded caller's queue is - MakeThreadedGsRenderer).
@@ -1515,9 +1637,11 @@ bool VulkanGsRenderer::TargetToMemory(std::uint32_t fbp, std::uint32_t fbw, std:
     rows = std::min(rows, t.height);
     if (first_row >= rows) return true;
     rows -= first_row;
-    if (!cols) return true;
+    if (first_col >= cols) return true;
     g_.Record([&](VkCommandBuffer cmd) {
-        SwizzleImage(cmd, SwizzleParams{fbp * 32, fbw, psm, cols, rows, t.pw(), 1, 0, first_row, t.scale}, t);
+        SwizzleParams params{fbp * 32, fbw, psm, cols, rows, t.pw(), 1, 0, first_row, t.scale};
+        params.col0 = first_col;
+        SwizzleImage(cmd, params, t);
         MemoryBarrier(cmd);
     });
     return true;
@@ -1545,7 +1669,7 @@ void VulkanGsRenderer::TargetFromMemory(std::uint32_t fbp, std::uint32_t fbw, st
 
 bool VulkanGsRenderer::DepthToMemory(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::uint32_t fbw,
                                      std::uint32_t zpsm, std::uint32_t cols, std::uint32_t rows,
-                                     std::uint32_t first_row) {
+                                     std::uint32_t first_row, std::uint32_t first_col) {
     Flush();                        // (as TargetToMemory)
     auto found = depths_.find(Key{zbp, width, height});
     if (found == depths_.end()) return false;
@@ -1554,17 +1678,94 @@ bool VulkanGsRenderer::DepthToMemory(std::uint32_t zbp, std::uint32_t width, std
     rows = std::min(rows, d.height);
     if (first_row >= rows) return true;
     rows -= first_row;
-    if (!cols) return true;
+    if (first_col >= cols) return true;
     g_.Record([&](VkCommandBuffer cmd) {
-        DepthOut(cmd, SwizzleParams{zbp * 32, fbw, zpsm, cols, rows, d.pw(), 1, 1, first_row, d.scale}, d);
+        SwizzleParams params{zbp * 32, fbw, zpsm, cols, rows, d.pw(), 1, 1, first_row, d.scale};
+        params.col0 = first_col;
+        DepthOut(cmd, params, d);
         MemoryBarrier(cmd);
     });
     return true;
 }
 
+void VulkanGsRenderer::ChannelShuffle(const GsShuffle& s) {
+    if (shuffle_pending_) {
+        const GsShuffle& p = shuffle_wait_;
+        const bool alike = s.fbp == p.fbp && s.fbw == p.fbw && s.view_fbp == p.view_fbp &&
+                           s.view_psm == p.view_psm && s.y0 == p.y0 &&
+                           s.y1 == p.y1 && s.du == p.du && s.dv == p.dv && s.tbp == p.tbp && s.tbw == p.tbw &&
+                           s.tex_psm == p.tex_psm && s.zbp == p.zbp && s.zwidth == p.zwidth &&
+                           s.zheight == p.zheight && s.write16 == p.write16 && s.ta0 == p.ta0 && s.ta1 == p.ta1 &&
+                           s.aem == p.aem && s.fba == p.fba;
+        const std::int32_t run = shuffle_wait_.x1 - shuffle_wait_.x0;
+        const std::int32_t at = shuffle_wait_.x0 + shuffle_count_ * shuffle_period_;
+        if (alike && s.x1 - s.x0 == run &&
+            (shuffle_count_ == 1 ? s.x0 >= shuffle_wait_.x0 + run : s.x0 == at)) {
+            if (shuffle_count_ == 1) shuffle_period_ = s.x0 - shuffle_wait_.x0;
+            ++shuffle_count_;
+            return;
+        }
+    }
+    Flush();                        // (the one pending first)
+    shuffle_wait_ = s;
+    shuffle_period_ = s.x1 - s.x0;
+    shuffle_count_ = 1;
+    shuffle_pending_ = true;
+}
+
+void VulkanGsRenderer::RecordShuffle() {
+    if (!shuffle_pending_) return;
+    shuffle_pending_ = false;
+    GsShuffle s = shuffle_wait_;
+    const std::int32_t run = s.x1 - s.x0, period = shuffle_period_;
+    s.x1 = s.x0 + (shuffle_count_ - 1) * period + run;
+    auto target = targets_.find(Key{s.fbp, s.fbw, 0x00});
+    auto depth = depths_.find(Key{s.zbp, s.zwidth, s.zheight});
+    if (!shuffle_pipeline_ || target == targets_.end() || depth == depths_.end()) return;
+    Image& t = target->second;
+    Image& d = depth->second;
+    // The pixels to visit: the 32-bit pages the sprite's 16-bit pages are
+    // (a page is 64 by 64 16-bit pixels, 64 by 32 32-bit ones, the same
+    // memory) - its pixels lie among them; the view's rows into the target.
+    const std::uint32_t down = s.view_fbp > s.fbp ? (s.view_fbp - s.fbp) / std::max(1u, s.fbw) * 32 : 0;
+    const std::uint32_t px0 = std::uint32_t(std::max(s.x0, 0)) / 64, px1 = (std::uint32_t(std::max(s.x1, 0)) + 63) / 64;
+    const std::uint32_t py0 = std::uint32_t(std::max(s.y0, 0)) / 64, py1 = (std::uint32_t(std::max(s.y1, 0)) + 63) / 64;
+    const std::uint32_t rx0 = std::min(px0 * 64, t.width), rx1 = std::min(px1 * 64, t.width);
+    const std::uint32_t ry0 = std::min(down + py0 * 32, t.height), ry1 = std::min(down + py1 * 32, t.height);
+    if (rx1 <= rx0 || ry1 <= ry0) return;
+    const ShuffleParams params{s.fbp * 32, s.fbw, s.view_psm, s.view_fbp * 32, rx0, ry0, rx1 - rx0, ry1 - ry0,
+                               s.x0, s.y0, s.x1, s.y1, std::max(period, 1), run, s.du, s.dv, s.tbp, s.tbw, s.tex_psm,
+                               s.zbp * 32, d.width, d.height, s.write16, s.ta0, s.ta1,
+                               (s.aem ? 1u : 0u) | (s.fba ? 2u : 0u), t.scale};
+    g_.Record([&](VkCommandBuffer cmd) {
+        drawn_ = DrawState{};
+        // One after another on the same image (two sprites can write the two
+        // halves of a pixel): what the one before wrote, first.
+        if (t.layout == VK_IMAGE_LAYOUT_GENERAL) {
+            ++g_barriers;
+            VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                 1, &b, 0, nullptr, 0, nullptr);
+        }
+        Transition(cmd, d, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        Transition(cmd, t, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        const VkDescriptorSet sets[2] = {StorageSet(t), DepthSampledSet(d)};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shuffle_pipeline_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shuffle_layout_, 0, 2, sets, 0, nullptr);
+        vkCmdPushConstants(cmd, shuffle_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
+        ++g_dispatches;
+        vkCmdDispatch(cmd, (params.cols * t.scale + 7) / 8, (params.rows * t.scale + 7) / 8, 1);
+        g_.Mark(cmd, kProfSwizzle);
+    });
+}
+
 void VulkanGsRenderer::TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm,
                                             std::uint32_t width, std::uint32_t height, std::uint32_t first_row,
-                                            std::uint32_t rows) {
+                                            std::uint32_t rows, std::uint32_t first_col, std::uint32_t end_col) {
     // An image not made yet holds nothing: all of it, then.
     if (!targets_.count(Key{fbp, fbw, psm})) return TargetFromMemory(fbp, fbw, psm, width, height);
     Flush();
@@ -1577,7 +1778,9 @@ void VulkanGsRenderer::TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw
     Image* t = TargetFor(state);
     if (first_row >= t->height) return;
     rows = std::min(rows, t->height - first_row);
-    SwizzleParams params{fbp * 32, fbw, psm, t->width, rows, t->pw(), 0, 0, first_row, t->scale};
+    SwizzleParams params{fbp * 32, fbw, psm, std::min(end_col, t->width), rows, t->pw(), 0, 0, first_row, t->scale};
+    params.col0 = first_col;
+    if (params.col0 >= params.cols) return;
     params.keep_colour = keep_colour_ && t->scale > 1;
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
@@ -2107,6 +2310,7 @@ bool VulkanGsRenderer::UploadReplacement(std::uint64_t id, std::uint32_t format,
         replacement_bytes_ -= old->second.bytes;
         DestroyTexture(old->second);
         replacements_.erase(old);
+        Resident(id, false);
     }
     Texture texture;
     if (!MakeImage(texture.image, width, height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -2138,6 +2342,7 @@ bool VulkanGsRenderer::UploadReplacement(std::uint64_t id, std::uint32_t format,
     texture.bytes = at;
     replacement_bytes_ += at;
     replacements_[id] = texture;
+    Resident(id, true);
     return true;
 }
 
@@ -2154,6 +2359,7 @@ void VulkanGsRenderer::EvictReplacements() {
         replacement_bytes_ -= found->second.bytes;
         DestroyTexture(found->second);
         replacements_.erase(found);
+        Resident(id, false);
     }
 }
 
@@ -2446,6 +2652,7 @@ void VulkanGsRenderer::UploadDepth(std::uint32_t zbp, std::uint32_t width, std::
 }
 
 void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v, std::size_t count) {
+    RecordShuffle();
     if (!SameBatch(state, state_)) Flush();
     // A primitive sampling the target it draws into, where the batch has
     // drawn already: the batch so far first (the next takes a new copy).
@@ -2714,6 +2921,7 @@ void VulkanGsRenderer::FlatQuadRange(FlatQuad& q, const GsDrawState& state) {
 }
 
 void VulkanGsRenderer::Flush() {
+    RecordShuffle();
     drawn_any_ = false;
     sprites_.clear();
     quads_.clear();
@@ -2791,6 +2999,11 @@ void VulkanGsRenderer::Flush() {
         }
         destination_set = SampledSet(*feedback_);
     }
+    // The profile's tag (MarkDraw): the target, and its texture's kind -
+    // none, a target (its FBP), memory - with the shader's own blending.
+    const std::uint32_t tag = (state_.fbp & 0x1FFu) << 20 | (state_.psm & 0x3Fu) << 14 |
+                              (shader_blend ? 1u << 13 : 0u) |
+                              (!state_.textured ? 0u : state_.texture_target ? (1u << 12) | (state_.tex_fbp & 0x1FFu) : 0x800u);
     FragmentParams params{};
     params.textured = state_.textured && (texture != &blank_ || source);
     params.tfx = std::uint32_t(state_.tfx);
@@ -2851,6 +3064,7 @@ void VulkanGsRenderer::Flush() {
                        std::uint32_t(state_.d) << 6;
     if (state_.textured && t->scale > 1) params.blend_ops |= (t->scale & 0xFFu) << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
+    params.blend_ops |= std::uint32_t(Blender16(state_)) << 17;     // gs.frag: S for the blender
     const std::uint32_t count = std::uint32_t(pending_.size());
     static int complaints = 0;
     if (!set && complaints < 5) {
@@ -2863,7 +3077,9 @@ void VulkanGsRenderer::Flush() {
             // needing one, or drawing elsewhere, ends the open pass first.
             const bool outside = state_.date || copy_first ||
                                  (source && source->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            if (outside || open_target_ != t || open_depth_ != depth) EndPass(cmd);
+            if (outside || open_target_ != t || open_depth_ != depth)
+                EndPass(cmd, state_.date ? kEndDate : copy_first ? kEndFeedback : outside ? kEndSource
+                             : open_target_ != t ? kEndTarget : kEndDepth);
             if (state_.date) DateSetup(cmd, *t, *depth, state_.datm);
             if (copy_first) {
                 ++g_feedback;
@@ -3011,7 +3227,7 @@ void VulkanGsRenderer::Flush() {
                                            sizeof params, &params);
                         ++g_draws;
                         vkCmdDraw(cmd, count, 1, first, 0);
-                        g_.Mark(cmd, kProfDraw);
+                        g_.MarkDraw(cmd, tag);
                     }
                 }
             }
@@ -3203,6 +3419,9 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (frag_) vkDestroyShaderModule(g_.device, frag_, nullptr);
     if (frag_blend_) vkDestroyShaderModule(g_.device, frag_blend_, nullptr);
     if (swizzle_pipeline_) vkDestroyPipeline(g_.device, swizzle_pipeline_, nullptr);
+    if (shuffle_pipeline_) vkDestroyPipeline(g_.device, shuffle_pipeline_, nullptr);
+    if (shuffle_layout_) vkDestroyPipelineLayout(g_.device, shuffle_layout_, nullptr);
+    if (shuffle_) vkDestroyShaderModule(g_.device, shuffle_, nullptr);
     for (auto& format : swizzle_image_specialised_)
         for (auto& direction : format)
             for (VkPipeline pipeline : direction)
@@ -3240,6 +3459,28 @@ std::string GpuProfileReport() {
         std::snprintf(text, sizeof text, " %s %.1f%%", kNames[i], 100.0 * double(ns[i]) / double(total));
         out += text;
     }
+    // The dearest kinds of draw: target (FBP, PSM), texture (none, a target
+    // by its FBP, memory), the shader's blending.
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> draws;
+    {
+        std::lock_guard<std::mutex> hold(g_draw_ns_lock);
+        for (const auto& [tag, t] : g_draw_ns) draws.emplace_back(t, tag);
+        g_draw_ns.clear();
+    }
+    std::sort(draws.rbegin(), draws.rend());
+    for (std::size_t i = 0; i < draws.size() && i < 12; ++i) {
+        const std::uint32_t tag = draws[i].second;
+        const std::uint32_t texture = tag & 0x1FFFu;
+        char what[48];
+        if (!texture) std::snprintf(what, sizeof what, "untextured");
+        else if (texture & (1u << 12)) std::snprintf(what, sizeof what, "from target %X", unsigned(texture & 0x1FFu));
+        else std::snprintf(what, sizeof what, "textured");
+        char text[128];
+        std::snprintf(text, sizeof text, "\n[gpu]     draws into %X/%02X, %s%s: %.1f%%", unsigned(tag >> 20),
+                      unsigned((tag >> 14) & 0x3Fu), what, (tag >> 13) & 1u ? ", shader blend" : "",
+                      100.0 * double(draws[i].first) / double(total));
+        out += text;
+    }
     return out;
 }
 
@@ -3252,7 +3493,15 @@ std::string RendererCounters() {
                   (unsigned long long)(now[2] - last[2]), (unsigned long long)(now[3] - last[3]),
                   (unsigned long long)(now[4] - last[4]), (unsigned long long)(now[5] - last[5]));
     for (int i = 0; i < 6; ++i) last[i] = now[i];
-    return text;
+    static std::uint64_t last_ends[kEndWhys] = {};
+    char ends[160];
+    std::snprintf(ends, sizeof ends, "; passes ended by: alpha test %llu, own copy %llu, a source %llu, target %llu, "
+                  "depth %llu, other work %llu",
+                  (unsigned long long)(g_pass_ends[0] - last_ends[0]), (unsigned long long)(g_pass_ends[1] - last_ends[1]),
+                  (unsigned long long)(g_pass_ends[2] - last_ends[2]), (unsigned long long)(g_pass_ends[3] - last_ends[3]),
+                  (unsigned long long)(g_pass_ends[4] - last_ends[4]), (unsigned long long)(g_pass_ends[5] - last_ends[5]));
+    for (int i = 0; i < kEndWhys; ++i) last_ends[i] = g_pass_ends[i];
+    return std::string(text) + ends;
 }
 
 std::string SubmitStats() {

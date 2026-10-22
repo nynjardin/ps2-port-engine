@@ -22,6 +22,8 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/ipu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vif1_worker.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/threads.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/high_fps.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/display_list.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iop.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/sdk.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/disc.cpp
@@ -39,6 +41,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/iopheap.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/spu2.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/audio.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/music.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/timers.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/pc_menu.cpp
@@ -71,12 +74,14 @@ target_link_libraries(ps2host PUBLIC ps2rt)
 
 # Texture packs (texture_pack.cpp): single headers, pinned by hash - xxHash
 # (BSD-2-Clause; PCSX2's names are XXH3 hashes), bcdec (MIT or Unlicense; DDS
-# BC1-BC7) and stb_image (MIT or public domain; PNG).
+# BC1-BC7) and stb_image (MIT or public domain; PNG). And for the host's music
+# (music.cpp), minimp3 (CC0: public domain; MP3).
 set(third_party_dir ${CMAKE_CURRENT_BINARY_DIR}/third_party)
 foreach(entry
         "xxhash.h|https://raw.githubusercontent.com/Cyan4973/xxHash/v0.8.3/xxhash.h|17973c0dc49d9854ca26caa191f0e12f7a424b68858d9a78de3860d959d85e4b"
         "bcdec.h|https://raw.githubusercontent.com/iOrange/bcdec/80859ed3b7afb1c527a2a99d70c61457bea72d0c/bcdec.h|134520764d96f70a27db814173616c89ad85db95fbd3328417c7a8c77e7ca189"
-        "stb_image.h|https://raw.githubusercontent.com/nothings/stb/2c980bb59875b0d32144a71867fbdebb2f77cd20/stb_image.h|594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3")
+        "stb_image.h|https://raw.githubusercontent.com/nothings/stb/2c980bb59875b0d32144a71867fbdebb2f77cd20/stb_image.h|594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3"
+        "minimp3.h|https://raw.githubusercontent.com/lieff/minimp3/afb604c06bc8beb145fecd42c0ceb5bda8795144/minimp3.h|5fb296a790734772b65a5514438cc06d14f24e539c13475ff2a7f737681c82c0")
     string(REPLACE "|" ";" parts "${entry}")
     list(GET parts 0 name)
     list(GET parts 1 url)
@@ -122,6 +127,44 @@ if(MSVC)
         target_compile_options(ps2rt PUBLIC /clang:-msse4.1)
     endif()
     target_compile_definitions(ps2rt PUBLIC _CRT_SECURE_NO_WARNINGS)
+    # PS2HOST_PGO (clang-cl): "generate" - a build that counts what runs
+    # (LLVM_PROFILE_FILE names where it writes them) - or the .profdata
+    # merged from such runs (llvm-profdata), to build with what they ran
+    # (engine/tools/port.py's pgo).
+    set(PS2HOST_PGO "" CACHE STRING "Profile-guided build: 'generate', or the .profdata to build with")
+    if(PS2HOST_PGO AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        if(PS2HOST_PGO STREQUAL "generate")
+            target_compile_options(ps2rt PUBLIC /clang:-fprofile-instr-generate)
+            target_compile_definitions(ps2rt PUBLIC PS2HOST_PGO_GENERATE=1)    # main.cpp writes the profile
+            get_filename_component(llvm_bin ${CMAKE_CXX_COMPILER} DIRECTORY)
+            file(GLOB profile_runtime ${llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib)
+            if(NOT profile_runtime)
+                message(FATAL_ERROR "PS2HOST_PGO=generate: LLVM's clang_rt.profile-x86_64.lib not found")
+            endif()
+            list(GET profile_runtime 0 profile_runtime)
+            target_link_libraries(ps2rt PUBLIC ${profile_runtime})
+        else()
+            # The profile's time in the flags: a new profile builds everything
+            # again (Ninja does not follow the file - objects from the last
+            # one beside the new one's would not link with ThinLTO).
+            file(TIMESTAMP ${PS2HOST_PGO} pgo_time "%Y%m%d%H%M%S")
+            target_compile_definitions(ps2rt PUBLIC PS2HOST_PGO_TIME=${pgo_time})
+            target_compile_options(ps2rt PUBLIC "/clang:-fprofile-instr-use=${PS2HOST_PGO}"
+                                   /clang:-Wno-profile-instr-unprofiled /clang:-Wno-profile-instr-out-of-date
+                                   /clang:-Wno-backend-plugin)
+        endif()
+    endif()
+    # PS2HOST_LTO (clang-cl, lld-link): ThinLTO - the host's functions the
+    # game's code calls (memory, the dispatch, the VU's) inlined across files.
+    # The link compiles the files again (the VU's take 2 GB and more each):
+    # as many at once as PS2HOST_LTO_JOBS (port.py: as for the compiler, by
+    # the memory there is - all the processors' worth ran out of it).
+    option(PS2HOST_LTO "ThinLTO (clang-cl and lld-link)" OFF)
+    set(PS2HOST_LTO_JOBS "all" CACHE STRING "ThinLTO's code generators at once in the link")
+    if(PS2HOST_LTO AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        target_compile_options(ps2rt PUBLIC /clang:-flto=thin)
+        target_link_options(ps2rt PUBLIC /opt:lldltojobs=${PS2HOST_LTO_JOBS})
+    endif()
     target_compile_options(ps2host PRIVATE /Z7)     # symbols for --sample, as the ports'
     target_compile_options(ps2rt PRIVATE /Z7)
     target_link_libraries(ps2host PRIVATE dbghelp winmm)  # ...which resolves them; 1 ms sleeps

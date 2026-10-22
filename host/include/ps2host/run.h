@@ -214,17 +214,51 @@ void GsSkipDraws(bool on);
    thread once the frame's packets are taken, so the EE need not wait for
    them. False when there is no handler: the EE syncs and does it itself. */
 void SetGsFrameHandler(std::function<void(u64)> handler);
+/* A game's choice (default off; real time, --gpu): a frame's picture is
+   taken at its blank's end, not its start - when the GS stream has moved
+   past the displayed buffer (the first draw to another, or the next frame's
+   end). What the game does to the displayed buffer in the blank - a copy of
+   its finished frame there (Burnout 3), DISPFB flipped by its vertical blank
+   handler - the console's CRTC shows in the very next field; taken at the
+   blank's start, every picture went out a frame late. For a game that draws
+   its next frame into the displayed buffer itself, the picture would go out
+   only at the next frame's end: it keeps this off. */
+void SetPresentAtBlankEnd(bool on);
 /* VIF1, VU1 and what feeds the GS on a thread of their own, in real time
    (vif1_worker.cpp): Vif1Run queues a command the worker runs in order (at
    once without the worker, or on it); JoinVif1 waits until all have run. */
 void StartVif1Worker();
 /* Whether real time runs VIF1 on its worker (default yes; --vif1-sync: no). */
 void SetVif1Worker(bool on);
+/* A VIF1 DMA chain as it is sent: its words, in runs (each: how many, and
+   the address they were read from) - the chain walked, its tags followed. */
+struct Vif1Chain {
+    std::vector<u32> words;
+    std::vector<std::pair<u32, u32>> runs;
+};
+/* Each VIF1 chain about to be sent goes to `filter` first (on the EE's
+   thread), which may keep it or change it - its words and runs - before it
+   is sent: a game's display list kept, or replaced by another (a high frame
+   rate's pictures between its steps). Empty: none (the default). */
+void SetVif1ChainFilter(std::function<void(Vif1Chain&)> filter);
 /* Real time: vertical blanks `factor` times as often as the display's (1:
    as they come) - for stretches the game only waits through, a loading
    screen counting frames while it loads (a game's hook turns it on and
    off). */
 void SetFastForward(unsigned factor);
+/* Real time: vertical blanks at `hz` a second instead of the display's
+   59.94 - a game's pictures at a screen's own refresh (a high frame rate's
+   DISPLAY); 0 for the display's again. SetFastForward above 1 comes first. */
+void SetBlankRate(double hz);
+/* Real time, from a guest thread (a game's override): the IOP runs a short
+   slice and what it answered is delivered - its replies, due timers, a
+   better thread woken - as in the EE's idle wait, so a loading step the game
+   takes once a frame can be taken again within the frame (the vertical
+   blanks, and what the screen shows, at their own pace). False, at once,
+   outside real time: there the step waits for its frame. */
+bool RunIopBetweenSteps();
+/* Real time: the next vertical blank is due (the EE has not taken it yet). */
+bool BlankDue();
 /* --fast-until N[:F]: in real time, the blanks F times as fast (8 unless
    said) until frame N - a scripted run's way to what is to be measured -
    then at their rate. Faster than the EE keeps up with, the game falls
@@ -239,6 +273,12 @@ void SetRealTimeFrom(u64 frame);
 void LeaveVirtualClock();
 /* The factor SetFastForward set (1: none). */
 unsigned FastForward();
+/* The vertical blanks' period now, in nanoseconds: the display's (59.94 a
+   second), SetFastForward's part of it or SetBlankRate's. */
+u64 BlankPeriodNs();
+/* The frames the game has drawn so far (a scripted run's --until-frame,
+   --frames-from count these). */
+u64 FrameNumber();
 /* Real time: when the last vertical blank was due (ClockNs), on the timer's
    own grid - not when the EE took it, which it does at its next loop head. */
 u64 LastVblankNs();
@@ -311,6 +351,17 @@ bool PumpWindow();
    the window opens with); and whether it is. */
 void SetWindowFullscreen(bool on);
 bool WindowFullscreen();
+/* The refresh rate of the screen the window is on, in Hz (0 when not known,
+   or no window). */
+float WindowRefreshRate();
+/* Fullscreen at the screen's own refresh (Display::SetKeepRefresh; the
+   window opens so when the "frame_rate" setting is "display"), not one 60
+   divides evenly. */
+void SetWindowKeepRefresh(bool keep);
+/* Pictures the window showed late, so far: dropped, or more than a blank
+   period and a half after the one before (a game's high frame rate steps
+   down on them). */
+u64 LatePictures();
 /* Vertical sync on or off (the "vsync" setting): no tearing, or the least
    delay. */
 void SetWindowVsync(bool on);
@@ -555,9 +606,21 @@ bool OpenAudio();
 /* Stops the sound and finishes the WAV recording (--audio-wav), before the
    process ends. */
 void CloseAudio();
+/* The pad's report held as it last was (true), the presses made meanwhile
+   shown at the next report not held: for a game whose menus run only in
+   some of the frames that read the pad (a high frame rate's frames between
+   its steps), so no press falls in a frame they never see. */
+void SetPadHold(bool hold);
 /* ...and/or recorded to a WAV file (--audio-wav). */
 bool OpenWavDump(const std::string& path);
 void AudioFrames(const short* frames, unsigned count);
+/* Whether the SPU2's output goes anywhere (a device or --audio-wav). */
+bool AudioActive();
+/* What the ring holds beyond its target dropped (faded in from where it
+   resumes): a run leaving virtual time (--real-time-from) made the sound of
+   its virtual frames faster than the device played it - the ring full, the
+   sound 0.7 s behind the picture and samples dropped for a minute. */
+void AudioResync();
 
 }  // namespace ps2host
 

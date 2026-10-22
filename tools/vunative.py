@@ -678,7 +678,7 @@ class Block:
         # the block's own flags on their way fill the queue from its start.
         settled = self.low(exit_t) >= 4 and in_flight <= 8
         if settled:
-            tail.append("C::LandAllFlags(v);")
+            tail.append("C::LandEveryFlag(v);")
         if landed is not None:
             if not settled:
                 tail.append("C::LandFlags(v, %s);" % self.texpr(exit_t))
@@ -694,7 +694,7 @@ class Block:
             mac, status, clip = self.snapshot(i)
             sets = ("true" if e["kind"] == "mac" else "false", "true" if e["kind"] == "clip" else "false")
             if settled:
-                tail.append("C::QueueFlags(v, %d, %s, %s, %s, %s, %s, %s);" %
+                tail.append("C::QueueFlagsAt(v, %d, %s, %s, %s, %s, %s, %s);" %
                             ((slot, self.texpr(e["ready"]), mac, status, clip) + sets))
             else:
                 tail.append("C::PushFlags(v, %s, %s, %s, %s, %s, %s, %s);" %
@@ -768,8 +768,8 @@ class Block:
             else:
                 tail.append("s.pc = 0x%Xu; s.delayed = %s;" % (next_pc, branch1 or "kNone"))
         # The head: the block's state as locals.
-        head = ["void %s(Vu& v, VuRunState& s, std::uint64_t limit);" % self.exact,
-                "void %s(Vu& v, VuRunState& s, std::uint64_t limit) {" % self.name,
+        head = ["PS2HOST_VU_BLOCK void %s(Vu& v, VuRunState& s, std::uint64_t limit);" % self.exact,
+                "PS2HOST_VU_BLOCK void %s(Vu& v, VuRunState& s, std::uint64_t limit) {" % self.name,
                 "    if (s.count + %d > limit) return;" % n,
                 "    if (s.stopping || s.delayed != kNone) return %s(v, s, limit);" % self.exact,
                 "    const u64 c0 = C::Cycle(v);",

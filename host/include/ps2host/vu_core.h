@@ -91,8 +91,28 @@ struct VuRunState {
 };
 
 /* A block of a compiled program: pairs run in a line from its first, the
-   run's state then left where it goes next (s.pc), or done. */
-using VuBlock = void (*)(Vu& vu, VuRunState& state, std::uint64_t limit);
+   run's state then left where it goes next (s.pc), or done. With clang a
+   block saves no registers for its caller (preserve_none): Windows' own
+   convention had every block save eight general and ten vector registers
+   and put them back, for the one small loop that calls it (Vu::RunCompiled),
+   which keeps its few values itself. */
+#if defined(__clang__) && defined(__x86_64__)
+#define PS2HOST_VU_BLOCK __attribute__((preserve_none, no_stack_protector))
+#else
+#define PS2HOST_VU_BLOCK
+#endif
+using VuBlock = void (PS2HOST_VU_BLOCK*)(Vu& vu, VuRunState& state, std::uint64_t limit);
+/* How a block goes on to the next where the generator knows which it is (the
+   pair after it, a branch's target): straight into it, as Vu::RunCompiled's
+   loop would have called it next - it starts only with as many pairs left
+   as it has, and returns to that loop otherwise. 2.5 frames of a race's VU1
+   work entered 700,000 blocks, each through the loop and a call it could
+   not foresee. Without clang the loop calls it. */
+#if defined(__clang__) && defined(__x86_64__)
+#define PS2HOST_VU_NEXT(block) [[clang::musttail]] return block(v, s, limit)
+#else
+#define PS2HOST_VU_NEXT(block) return
+#endif
 
 /* A microprogram compiled ahead of time. `code` is what it was compiled
    from, as runs: a count of runs, then for each its byte address in
@@ -175,7 +195,6 @@ struct VuCore {
         out.vf = it;
         out.lanes = dest;
         std::memcpy(out.value, q, 16);
-        out.clean = Clean4(q);
     }
     /* Whether Clean leaves all four fields as they are: no infinity or NaN
        exponent, and no denormal (a zero exponent with a mantissa). */
@@ -272,11 +291,9 @@ struct VuCore {
         _mm_storeu_si128(reinterpret_cast<__m128i*>(out.value), after);
     }
     static PS2HOST_VU_INLINE void Move(Vu& v, Vu::Pending& out, int it, int fs, u32 dest) {
-        out.clean = !((v.unclean_ >> fs) & 1);
         HoldVf(v, out, it, dest, _mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])));
     }
     static PS2HOST_VU_INLINE void Mr32(Vu& v, Vu::Pending& out, int it, int fs, u32 dest) {
-        out.clean = !((v.unclean_ >> fs) & 1);
         HoldVf(v, out, it, dest, _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])),
                                                    _MM_SHUFFLE(0, 3, 2, 1)));
     }
@@ -294,25 +311,18 @@ struct VuCore {
     }
     static PS2HOST_VU_INLINE void Move(Vu& v, Vu::Pending& out, int it, int fs, u32 dest) {
         const u32 value[4] = {v.regs.vf[fs][0], v.regs.vf[fs][1], v.regs.vf[fs][2], v.regs.vf[fs][3]};
-        out.clean = !((v.unclean_ >> fs) & 1);
         HoldVf(v, out, it, dest, value);
     }
     static PS2HOST_VU_INLINE void Mr32(Vu& v, Vu::Pending& out, int it, int fs, u32 dest) {
         const u32* a = v.regs.vf[fs];
         const u32 value[4] = {a[1], a[2], a[3], a[0]};
-        out.clean = !((v.unclean_ >> fs) & 1);
         HoldVf(v, out, it, dest, value);
     }
 #endif
-    /* An upper write of Dest's fields into `reg`: clean ones clean the
-       register when they are all of it (else it stays as it was); others
-       make it unknown. */
+    /* An upper write of Dest's fields into `reg`, clean or not: nothing to
+       note now (the FMACs clamp whatever they do not know clean: Fmac). */
     template <u32 Dest>
-    static PS2HOST_VU_INLINE void Wrote(Vu& v, int reg, bool clean) {
-        if (reg <= 0) return;
-        if (!clean) v.unclean_ |= 1u << reg;
-        else if constexpr (Dest == 15) v.unclean_ &= ~(1u << reg);
-    }
+    static PS2HOST_VU_INLINE void Wrote(Vu&, int, bool) {}
     static PS2HOST_VU_INLINE void Mfir(Vu& v, Vu::Pending& out, int it, int is, u32 dest) {
         u32 x = v.regs.vc[is] & 0xFFFF;
         if (x & 0x8000) x |= 0xFFFF0000u;
@@ -386,6 +396,39 @@ struct VuCore {
     static PS2HOST_VU_INLINE u32& Status(Vu& v, u64 cycle) { LandFlags(v, cycle); return v.status; }
     static PS2HOST_VU_INLINE u32& StatusLatest(Vu& v) { return v.status_latest_; }
     static PS2HOST_VU_INLINE u32 Mac(Vu& v, u64 cycle) { LandFlags(v, cycle); return v.mac; }
+    /* The landed flags where the queue is known empty (vurecomp.py: Flags). */
+    static PS2HOST_VU_INLINE u32& ClipNow(Vu& v) { return v.clip; }
+    static PS2HOST_VU_INLINE u32& StatusNow(Vu& v) { return v.status; }
+    static PS2HOST_VU_INLINE u32 MacNow(Vu& v) { return v.mac; }
+
+    /* The flags as the generator follows them within a block (vurecomp.py:
+       Flags). A pair's flags are held in its locals, not queued: the block
+       knows which have landed where it reads them. These land them - after
+       everything still queued, which is older and has landed too (LandAll
+       Flags) - or queue them as the block leaves, those that may not have
+       landed yet. */
+    static PS2HOST_VU_INLINE void LandAllFlags(Vu& v) { LandFlags(v, ~u64(0)); }
+    /* A pair's MAC and STATUS, landed (`status`'s sticky bits with every
+       one's before it). */
+    static PS2HOST_VU_INLINE void LandMac(Vu& v, u32 mac, u32 status) {
+        v.mac = mac;
+        v.status = (v.status & ~0x3u) | (status & 0xC3u);
+    }
+    static PS2HOST_VU_INLINE void LandClip(Vu& v, u32 clip) { v.clip = clip; }
+    /* Queued as FinishUpper would have at the pair's issue cycle `at`. */
+    static PS2HOST_VU_INLINE void QueueFlags(Vu& v, u64 at, u32 mac, u32 status, u32 clip, bool sets_mac,
+                                             bool sets_clip) {
+        if (v.flag_count_ == 8) LandFlags(v, at);
+        if (v.flag_count_ < 8) {
+            Vu::FlagWrite& f = v.flag_queue_[(v.flag_head_ + v.flag_count_++) & 7];
+            f.ready = at + kFmacLatency;
+            f.mac = mac;
+            f.status = status;
+            f.clip = clip;
+            f.sets_mac = sets_mac;
+            f.sets_clip = sets_clip;
+        }
+    }
 
     // ------------------------------------------------------------ upper
 #if PS2RT_VU_SSE
@@ -403,33 +446,25 @@ struct VuCore {
         else if constexpr (Operand == 4) b = _mm_set1_epi32(int(c.vc[lifted::kRegQ]));
         else if constexpr (Operand == 5) b = _mm_set1_epi32(int(c.vc[lifted::kRegI]));
         else b = _mm_set1_epi32(int(c.vf[ft][Operand]));
-        // Cleaned here where the block does not know them clean and the run
-        // has not found them clean (unclean_); LanesSse then cleans neither.
-        // A run has DAZ and FTZ on (VuRounding): clamped is clean enough
-        // (ClampLanes), here and for the result.
-        // MAX and MINI take their operands as they are, and may leave a
-        // field unclean.
+        // Cleaned here where the block does not know them clean; LanesSse
+        // then cleans neither. A run has DAZ and FTZ on (VuRounding): clamped
+        // is clean enough (ClampLanes, four instructions), here and for the
+        // result - and a clean field clamped is the field itself, so every
+        // operand not known clean is clamped, with no record kept of which
+        // registers a run has found clean (testing and keeping that record
+        // in memory, operand by operand, cost more than the clamps: 12% of
+        // the VU bench). MAX and MINI take their operands as they are.
         constexpr bool kRaw = Op == lifted::kMax_ || Op == lifted::kMini;
-        if constexpr ((Known & 1) == 0 && !kRaw)
-            if ((v.unclean_ >> fs) & 1) a = lifted::ClampLanes(a);
-        if constexpr ((Known & 2) == 0 && !kRaw) {
-            if constexpr (Operand == 4 || Operand == 5) b = lifted::ClampLanes(b);
-            else if ((v.unclean_ >> ft) & 1) b = lifted::ClampLanes(b);
-        }
-        // ACC as the operands: cleaned only where not known clean (MADD,
-        // MSUB read it).
+        if constexpr ((Known & 1) == 0 && !kRaw) a = lifted::ClampLanes(a);
+        if constexpr ((Known & 2) == 0 && !kRaw) b = lifted::ClampLanes(b);
+        // ACC as the operands (MADD, MSUB read it): the same.
         __m128i acc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(c.vacc));
         if constexpr ((Known & 4) == 0 && (Op == lifted::kMadd || Op == lifted::kMsub))
-            if (v.acc_unclean_) acc = lifted::ClampLanes(acc);
+            acc = lifted::ClampLanes(acc);
         const __m128i result = lifted::LanesSse<Op, Known | 7, true>(a, b, acc);
-        // An FMAC's result is clean (MAX and MINI write no ACC): all four
-        // fields of it make ACC clean.
-        if constexpr (To < 0 && Dest == 15 && !kRaw) v.acc_unclean_ = false;
-        else if constexpr (To < 0 && kRaw) v.acc_unclean_ = true;
         if constexpr (SetFlags == 1) FlagsOf<Dest>(v, result);
         else if constexpr (SetFlags == 2) StickyFlagsOf<Dest>(v, result);
-        if constexpr (To > 0 && kRaw) v.unclean_ |= 1u << To;
-        else if constexpr (To > 0 && Dest == 15) v.unclean_ &= ~(1u << To);    // all four fields, clean
+        else if constexpr (SetFlags == 3) MacFlagsOf<Dest>(v, result);
         if constexpr (To == 0) {
             _mm_storeu_si128(reinterpret_cast<__m128i*>(v.discarded_), result);
             return;
@@ -463,6 +498,7 @@ struct VuCore {
         else lifted::RunFmac(v.regs, f);
         if constexpr (SetFlags == 1) Flags<To, Dest>(v);
         else if constexpr (SetFlags == 2) StickyFlags<To, Dest>(v);
+        else if constexpr (SetFlags == 3) MacFlags<To, Dest>(v);
     }
 #endif
     /* Macro mode's COP2 operations, as it runs them (vu0.cpp's Cop2), without
@@ -590,9 +626,6 @@ struct VuCore {
     /* Any other upper operation, as macro mode's COP2 runs it. */
     static void Cop2(Vu& v, u32 word) {
         lifted::Cop2(v.regs, 0x4A000000u | (word & 0x01FFFFFF));
-        // Whatever it wrote is not known clean: fd's and ft's fields, ACC.
-        v.unclean_ |= ((1u << ((word >> 6) & 31)) | (1u << ((word >> 16) & 31))) & ~1u;
-        v.acc_unclean_ = true;
     }
     /* CLIP: fs.xyz against |ft.w| - compared as Clean leaves them: the
        magnitudes of clean floats are in the order of their bits (a
@@ -640,7 +673,36 @@ struct VuCore {
         const u32 sign = u32(_mm_movemask_ps(_mm_castsi128_ps(bits))) & kLanes;
         v.status_latest_ |= ((zero ? 1u : 0u) | (sign ? 2u : 0u)) << 6;
     }
+    /* MAC alone, for the fast blocks of a program that never reads STATUS
+       (vurecomp.py: no_status): STATUS is left as it was - its bits, sticky
+       ones and all, were a read and a write of status_latest_ chaining every
+       FMAC to the one before. */
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE void MacFlagsOf(Vu& v, __m128i bits) {
+        bits = _mm_shuffle_epi32(bits, _MM_SHUFFLE(0, 1, 2, 3));
+        const __m128i magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF));
+        const u32 zero = u32(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(magnitude, _mm_setzero_si128()))));
+        const u32 sign = u32(_mm_movemask_ps(_mm_castsi128_ps(bits)));
+        v.mac_latest_ = (zero & Dest) | (sign & Dest) << 4;
+    }
 #endif
+    /* The same for an upper that is not an FMAC (MacFlagsOf). */
+    template <int Target, u32 Dest>
+    static PS2HOST_VU_INLINE void MacFlags(Vu& v) {
+        const u32* out = Target > 0 ? v.regs.vf[Target] : Target == 0 ? v.discarded_ : v.regs.vacc;
+#if PS2RT_VU_SSE
+        MacFlagsOf<Dest>(v, _mm_loadu_si128(reinterpret_cast<const __m128i*>(out)));
+#else
+        u32 m = 0;
+        for (int lane = 0; lane < 4; ++lane) {
+            if (!(Dest & (8u >> lane))) continue;
+            const u32 bits = lifted::Clean(out[lane]);
+            if ((bits & 0x7FFFFFFFu) == 0) m |= 8u >> lane;
+            if (bits & 0x80000000u) m |= 0x80u >> lane;
+        }
+        v.mac_latest_ = m;
+#endif
+    }
     template <int Target, u32 Dest>
     static PS2HOST_VU_INLINE void Flags(Vu& v) {
         const u32* out = Target > 0 ? v.regs.vf[Target] : Target == 0 ? v.discarded_ : v.regs.vacc;
@@ -702,14 +764,6 @@ struct VuCore {
                     v.vf_ready_[pending.vf][lane] = ready;
                 }
             }
-            // Clean only if what lands is, and either it is all of the
-            // register or the rest was clean; with the upper writing the same
-            // register too, not known.
-            const u32 reg = 1u << pending.vf;
-            if (pending.clean && written != pending.vf && (pending.lanes == 15 || !(v.unclean_ & reg)))
-                v.unclean_ &= ~reg;
-            else
-                v.unclean_ |= reg;
         }
         FinishUpper(v, cycle, written, lanes, set_flags, sets_mac, sets_clip);
         if (pending.q_latency) {
@@ -815,8 +869,9 @@ struct VuCore {
        cycle its pair issued (a full queue lands what has arrived by then). */
     /* Native blocks leaving four cycles or more after they began: whatever
        was queued before them has landed by now (an FMAC's flags land four
-       cycles after its issue), in order, without a time compared. */
-    static PS2HOST_VU_INLINE void LandAllFlags(Vu& v) {
+       cycles after its issue), in order, without a time compared - the
+       queue's head back at slot 0 (QueueFlagsAt). */
+    static PS2HOST_VU_INLINE void LandEveryFlag(Vu& v) {
         for (int n = v.flag_count_, at = v.flag_head_; n; --n, at = (at + 1) & 7) {
             const Vu::FlagWrite& f = v.flag_queue_[at];
             if (f.sets_mac) {
@@ -828,9 +883,9 @@ struct VuCore {
         v.flag_head_ = 0;
         v.flag_count_ = 0;
     }
-    /* After LandAllFlags: the block's flags still on their way, the queue's
-       slot `slot` (from 0, in order), Count of them in all. */
-    static PS2HOST_VU_INLINE void QueueFlags(Vu& v, int slot, u64 ready, u32 mac, u32 status, u32 clip,
+    /* After LandEveryFlag: the block's flags still on their way, the queue's
+       slot `slot` (from 0, in order), QueuedFlags of them in all. */
+    static PS2HOST_VU_INLINE void QueueFlagsAt(Vu& v, int slot, u64 ready, u32 mac, u32 status, u32 clip,
                                              bool sets_mac, bool sets_clip) {
         Vu::FlagWrite& f = v.flag_queue_[slot];
         f.ready = ready;

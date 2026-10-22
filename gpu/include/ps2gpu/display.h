@@ -69,11 +69,19 @@ public:
     virtual void SetVsync(bool on) { (void)on; }
     virtual bool Vsync() const { return false; }
 
+    /* The refresh rate of the screen the window is on, in its present mode
+       (fullscreen's own, EvenMode's), in Hz: 0 when not known. */
+    virtual float RefreshRate() const { return 0.0f; }
+
     /* The window's height in the screen's pixels (0 when not known). */
     virtual std::uint32_t PixelHeight() const { return 0; }
 
     /* Fullscreen (borderless, the desktop's resolution) or a window. */
     virtual void SetFullscreen(bool on) { (void)on; }
+    /* Fullscreen at the desktop's own refresh (a high frame rate that
+       follows the screen: 144 Hz kept), not one that 60 divides evenly (120
+       Hz on a 144 Hz screen, the default); taken again now if fullscreen. */
+    virtual void SetKeepRefresh(bool keep) { (void)keep; }
     virtual bool Fullscreen() const { return false; }
     /* The picture's shape on the screen, width over height: 4:3 as a
        television showed it (the default), 16:9, or 0 - the window's own

@@ -45,6 +45,7 @@
 #include <thread>
 #include <vector>
 
+#include "ps2host/music.h"
 #include "ps2host/run.h"
 #include "ps2host/timeline.h"
 
@@ -83,6 +84,7 @@ struct Device {
     bool mute = false;
     bool log = false;
     std::atomic<bool> open{false}, stop{false};
+    std::atomic<bool> resync{false};    // AudioResync: the backlog dropped at the next Render
     std::atomic<int> opened{0};         // the audio thread's answer: 1 a device, -1 none
     std::thread thread;
     std::FILE* wav = nullptr;
@@ -147,6 +149,11 @@ inline float Cubic(float a, float b, float c, float d, float t) {
 }
 
 void Device::Render(float* out, unsigned frames) {
+    if (resync.exchange(false) && ring.Filled() > target_frames) {
+        ring.read.store(ring.written.load(std::memory_order_acquire) - target_frames, std::memory_order_release);
+        smoothed_fill = double(target_frames);
+        fade = kFadeFrames;
+    }
     const unsigned long long available = ring.Filled();
     // The fill the rate control steers by: the ring's, smoothed - it jumps by a
     // whole batch each time the SPU2 delivers one.
@@ -408,8 +415,29 @@ bool OpenWavDump(const std::string& path) {
     return true;
 }
 
+void AudioResync() { D().resync = true; }
+
+bool AudioActive() {
+    Device& d = D();
+    return d.open || d.wav;
+}
+
 void AudioFrames(const short* frames, unsigned count) {
     Device& d = D();
+    // PS2HOST_MUSIC_TEST=file.mp3: that MP3 played over the game from its
+    // first sound (music.h's check).
+    static const bool music_test = [] {
+        if (const char* path = std::getenv("PS2HOST_MUSIC_TEST")) MusicPlay(path);
+        return true;
+    }();
+    (void)music_test;
+    // The host's music mixed in (music.h): into a copy, the SPU2's own as it is.
+    static thread_local std::vector<short> mixed;
+    if (MusicMixing()) {
+        mixed.assign(frames, frames + 2 * std::size_t(count));
+        MusicMix(mixed.data(), count);
+        frames = mixed.data();
+    }
     if (d.wav) {
         std::fwrite(frames, 4, count, d.wav);
         d.wav_frames += count;

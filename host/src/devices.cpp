@@ -27,6 +27,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <functional>
@@ -46,6 +47,7 @@
 #include "ps2host/ipu.h"
 #include "ps2host/memory.h"
 #include "ps2host/path3.h"
+#include "ps2host/music.h"
 #include "ps2host/run.h"
 #include "ps2host/settings.h"
 #include "ps2host/vif.h"
@@ -110,6 +112,12 @@ void Path3(const u32* words, u32 count, u32 from) {
     else GsWords(3, words, count, from);
 }
 
+/* The same from words `owner` keeps (VIF1's worker's copy): held, not copied. */
+void Path3Kept(const u32* words, u32 count, u32 from, std::shared_ptr<const void> owner) {
+    if (g_path3_masked || !g_path3_held.empty()) g_path3_held.Push(words, count, std::move(owner));
+    else GsWords(3, words, count, from);
+}
+
 void ReleasePath3(bool all) {
     g_path3_held.ReleaseBlock(all, [](const u32* words, std::size_t count) {
         GsWords(3, words, u32(count));
@@ -136,14 +144,19 @@ std::string Scratchpad(const Channel& ch, u32 chcr, bool describe) {
     char text[160];
     if (ch.base == 0x1000D000u) {                       // SPR_FROM
         if ((chcr >> 2) & 3) return "chain mode is not modelled (nothing copied)";
-        for (u32 i = 0; i < 16 * qwc; i += 16) {           // a quadword at a time (SADR is aligned)
+        // Up to the scratchpad's end at a time (where SADR wraps); a
+        // quadword at a time where it is not plain memory.
+        for (u32 i = 0; i < 16 * qwc;) {
             const u32 from = kScratchpadBase + ((sadr + i) & 0x3FF0u);
-            u8* to = Plain(m, madr + i) ? m.Translate(madr + i, 16) : nullptr;
-            if (const u8* source = to ? m.Translate(from, 16) : nullptr) {
-                std::memcpy(to, source, 16);
+            const u32 run = std::min(16 * qwc - i, kScratchpadBase + 0x4000u - from);
+            u8* to = Plain(m, madr + i) ? m.Translate(madr + i, run) : nullptr;
+            if (const u8* source = to ? m.Translate(from, run) : nullptr) {
+                std::memmove(to, source, run);
+                i += run;
                 continue;
             }
             for (u32 k = 0; k < 16; k += 4) m.Write(madr + i + k, m.Read(from + k, 4), 4);
+            i += 16;
         }
         *Register(ch.base + kMadr) = madr + 16 * qwc;
         *Register(ch.base + kQwc) = 0;
@@ -156,10 +169,21 @@ std::string Scratchpad(const Channel& ch, u32 chcr, bool describe) {
                           u32(m.Read(ch.base + kAsr0, 4)), u32(m.Read(ch.base + kAsr1, 4))};
     u8* scratchpad = Plain(m, kScratchpadBase) ? m.Translate(kScratchpadBase, kScratchpadSize) : nullptr;
     const DmaOutcome outcome = SendDmaBlocks(state, [&sadr, scratchpad](const u32* words, u32 count, u32 from) {
+        if (scratchpad) {
+            // Up to the scratchpad's end at a time (where SADR wraps).
+            for (u32 i = 0; i < count;) {
+                const u32 at = sadr & 0x3FFCu;
+                const u32 n = std::min(count - i, (0x4000u - at) / 4);
+                std::memcpy(scratchpad + at, &words[i], 4 * std::size_t(n));
+                i += n;
+                sadr = (sadr + 4 * n) & 0x3FFFu;
+            }
+            if (count) g_dma_source = from + 4 * (count - 1);
+            return;
+        }
         for (u32 i = 0; i < count; ++i) {
             g_dma_source = from + 4 * i;
-            if (scratchpad) std::memcpy(scratchpad + (sadr & 0x3FFCu), &words[i], 4);
-            else GuestMemory().Write(kScratchpadBase + (sadr & 0x3FFCu), words[i], 4);
+            GuestMemory().Write(kScratchpadBase + (sadr & 0x3FFCu), words[i], 4);
             sadr = (sadr + 4) & 0x3FFFu;
         }
     });
@@ -265,6 +289,9 @@ bool FrameSkipOn() {
     static const bool on = Setting("frame_skip", "on") != "off";
     return on;
 }
+// The words copied for VIF1's worker (Walk), for the frames line.
+u64 g_chain_words = 0;
+std::function<void(Vif1Chain&)> g_vif1_filter;     // SetVif1ChainFilter
 
 // Walks a started transfer and leaves the registers as it would; returns a
 // note (when `describe`: a transfer is noted only the first time).
@@ -291,6 +318,19 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
         sink = [copy](const u32* words, u32 count, u32 from) {
             copy->words.insert(copy->words.end(), words, words + count);
             copy->runs.emplace_back(count, from);
+            g_chain_words += count;
+        };
+    // A VIF1 chain a filter takes (SetVif1ChainFilter): walked whole first,
+    // filtered, then sent as the filter left it.
+    const bool filtered = g_vif1_filter && ch.base == 0x10009000u;
+    static thread_local Vif1Chain chain;        // (its room kept: a scene's list is megabytes)
+    chain.words.clear();
+    chain.runs.clear();
+    DmaBlockSink send = sink;
+    if (filtered)
+        sink = [](const u32* words, u32 count, u32 from) {
+            chain.words.insert(chain.words.end(), words, words + count);
+            chain.runs.emplace_back(count, from);
         };
     char text[160] = "";
     try {
@@ -298,6 +338,21 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
         // The GIF takes no chain tags (TTE): dma.h.
         const bool tags = ch.base != 0x1000A000u;
         const DmaOutcome outcome = SendDmaBlocks(state, sink, 1u << 16, tags);
+        if (filtered) {
+            g_vif1_filter(chain);
+            if (queued && copy->words.empty()) {
+                // The worker's copy is the chain as filtered: taken, not copied.
+                g_chain_words += chain.words.size();
+                copy->words.swap(chain.words);
+                copy->runs.swap(chain.runs);
+            } else {
+                const u32* at = chain.words.data();
+                for (const auto& [count, from] : chain.runs) {
+                    send(at, count, from);
+                    at += count;
+                }
+            }
+        }
         if (describe)
             std::snprintf(text, sizeof text, "%llu quadwords, %u tags%s",
                       static_cast<unsigned long long>(outcome.quadwords), outcome.tags,
@@ -337,7 +392,7 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
                 if (skip) GsSkipDraws(true);
                 const u32* at = copy->words.data();
                 for (const auto& [count, from] : copy->runs) {
-                    if (gif) Path3(at, count, from);
+                    if (gif) Path3Kept(at, count, from, copy);
                     else Vif1().Words(at, count, from);
                     at += count;
                 }
@@ -365,6 +420,8 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
 constexpr u32 kVif1Fifo = 0x10005000u;
 
 }  // namespace
+
+void SetVif1ChainFilter(std::function<void(Vif1Chain&)> filter) { g_vif1_filter = std::move(filter); }
 
 namespace {
 std::string g_frames_dir;
@@ -478,6 +535,13 @@ void FrameTimes(u64 frame) {
                       (unsigned long long)(skipped - last_skipped));
     }
     last_skipped = skipped;
+    static u64 last_chain_words = 0;
+    if (g_chain_words != last_chain_words && seconds > 0) {
+        const std::size_t used = std::strlen(job_text);
+        std::snprintf(job_text + used, sizeof job_text - used, ", %.1f MB a second copied for VIF1's worker",
+                      double(g_chain_words - last_chain_words) * 4 / 1e6 / seconds);
+    }
+    last_chain_words = g_chain_words;
     // Frames here are vertical blanks; a game that cannot keep up draws a
     // picture every other one (or less), which the VIF1 transfers show.
     {
@@ -583,6 +647,7 @@ void RequestCapture() { g_capture_request = true; }
 
 void FrameDone(u64 frame) {
     FrameTimes(frame);
+    MusicBlank();
     timeline::Frame(frame);
     SampleFrame(frame);
     Vu::SnapshotFrame(frame);
@@ -610,8 +675,11 @@ void FrameDone(u64 frame) {
     const bool cpu_reads_gs = dump || (g_dump_frame >= 0 && (long long)frame == g_dump_frame) || g_trace_frame >= 0 ||
                               capturing;
     if (!cpu_reads_gs && GsFrame(frame)) {
-        DbcFrame();
+        // The window's events first: the controllers' and the keyboard's
+        // state as of now goes into the pad block the game reads this frame
+        // (taken after it, every press reached the game a frame late).
         if (!PumpWindow()) throw GuestExit{0};          // the user closed the window
+        DbcFrame();
         return;
     }
     // What reads the GS from here on - the picture, the GPU's frame, the
@@ -729,6 +797,25 @@ void InstallDevices() {
                               unsigned(memory.Read(qwc, 4)), unsigned(memory.Read(ch.base + kTadr, 4)));
             if (traced) std::fprintf(gs::TheGs().trace_out, "[dma] %s\n", text);
             if (ch.base == 0x10009000u) ++g_vif1_transfers;
+            // PS2HOST_TRACE_KICKS=<frame>: in that frame, each VIF1 or GIF
+            // transfer started, with the guest's calls that started it - who
+            // draws what (a high frame rate's search for a game's draw).
+            static const long long kick_frame = [] {
+                const char* e = std::getenv("PS2HOST_TRACE_KICKS");
+                return e ? std::atoll(e) : -1ll;
+            }();
+            if (kick_frame >= 0 && (ch.base == 0x10009000u || ch.base == 0x1000A000u) &&
+                (long long)FrameNumber() == kick_frame) {
+                std::string calls;
+                for (u32 a : CurrentCalls()) {
+                    char one[16];
+                    std::snprintf(one, sizeof one, " %08X", unsigned(a));
+                    calls += one;
+                }
+                std::fprintf(stderr, "[kick] %s MADR=0x%08X QWC=%u CHCR=0x%08X <-%s\n", ch.name,
+                             unsigned(memory.Read(madr, 4)), unsigned(memory.Read(qwc, 4)), unsigned(value),
+                             calls.c_str());
+            }
             const std::string walked = ch.walked ? Walk(ch, u32(value), describe) : std::string();
             if (describe) Note(key, ch.walked ? std::string(text) + ": " + walked : std::string(text));
             *Register(chcr) &= ~0x100u;                         // done

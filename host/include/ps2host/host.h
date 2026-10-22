@@ -118,6 +118,7 @@ struct Options {
     std::string frames_dir;        /* write the displayed picture here as BMP files */
     int frames_every = 30;         /* ...every this many frames */
     long long frames_from = 0;     /* ...from this frame on (--frames-from) */
+    int frames_limit = 200;        /* ...at most this many (--frames-limit) */
     bool window = false;           /* show the picture in a window as it runs */
     bool gs_trace = false;         /* log GS image transfers and textured primitives */
     long long gs_trace_frame = -1; /* ... during this frame only */
@@ -137,7 +138,7 @@ struct Options {
     bool vu_interpret = false;     /* --vu-interpret: no compiled microprograms */
     bool vu_exact = false;         /* --vu-exact: VU1's exact flags even where the game defaults to fast (and no native blocks) */
     bool vu_fast = false;          /* --vu-fast: VU1 programs without MAC/STATUS readers skip those flags */
-    bool vu_native = true;         /* compiled VU programs run their native blocks (vunative.py); --vu-exact: not */
+    bool vu_native = false;        /* compiled VU programs run their native blocks (vunative.py), where generated: --vu-native */
     bool gpu = false;              /* draw on the GPU instead of the software GS (gpu_bridge.cpp) */
     bool gpu_shadow = false;       /* draw on the GPU too, and compare (gpu_bridge.cpp) */
     bool gpu_shadow_rtt = false;   /* ...sampling GPU targets as textures */

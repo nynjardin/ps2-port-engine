@@ -101,9 +101,10 @@ public:
        FMAC of its own lands would see. */
     bool fast = false;
     /* Compiled programs run their native blocks (vunative.py: the pipeline
-       worked out as the code was generated, registers in locals), which end
-       in the same state as the exact ones; --vu-exact runs the exact ones. */
-    bool native = true;
+       worked out as the code was generated, registers in locals) where the
+       generator made them (vurecomp.py: NATIVE, off - they predate the
+       clamped operands and held flags); --vu-native. */
+    bool native = false;
     /* For tests: everything a run can change, the same in both (`flags`
        false: but the MAC and STATUS flags, landed, latest and in flight). */
     bool SameState(const Vu& other, bool flags = true) const;
@@ -125,6 +126,8 @@ public:
 
     /* For tests: one 128-bit quadword of data memory. */
     u32* Quad(u32 address);
+    /* The quadwords from `address` (as Quad takes it) to data memory's end. */
+    u32 QuadsToEnd(u32 address) const { return data_mask_ + 1 - (address & data_mask_); }
 
 private:
     friend struct VuCore;

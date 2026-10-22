@@ -51,9 +51,22 @@ public:
         const std::uint32_t n = std::uint32_t(count);
         // The images its batch makes (VulkanGsRenderer::Flush): its target,
         // and its depth buffer as large as the target was made.
+        // (The last ones kept: a draw's target and depth buffer are nearly
+        // always the last draw's, and the sets' hashing for each was 5% of
+        // the GS thread in splitscreen.)
         if (n >= 3) {
-            const Size made = Made(state.fbp, state.fbw, state.psm, state.width, state.height);
-            if (state.depth) depths_.insert(DepthKey(state.zbp, made.w, std::min(made.h, kDepthRows)));
+            const std::uint64_t target = TargetKey(state.fbp, state.fbw, state.psm);
+            if (target != last_target_) {
+                last_made_ = Made(state.fbp, state.fbw, state.psm, state.width, state.height);
+                last_target_ = target;
+            }
+            if (state.depth) {
+                const std::uint64_t depth = DepthKey(state.zbp, last_made_.w, std::min(last_made_.h, kDepthRows));
+                if (depth != last_depth_) {
+                    depths_.insert(depth);
+                    last_depth_ = depth;
+                }
+            }
         }
         if (has_last_ && std::memcmp(&state, &last_, sizeof state) == 0) {
             Op(kDrawSame, sizeof n + n * sizeof(GsVertex));
@@ -65,6 +78,17 @@ public:
             Put(&state, sizeof state);
             Put(&n, sizeof n);
         }
+        Put(vertices, n * sizeof(GsVertex));
+        End();
+    }
+    /* The last state again (the bridge's fast path): its 200 bytes not
+       compared - 4.5% of the GS thread in splitscreen - where `gouraud`, the
+       one field that path changes, is the last one's too. */
+    void DrawTrianglesAgain(const GsDrawState& state, const GsVertex* vertices, std::size_t count) override {
+        if (!has_last_ || state.gouraud != last_.gouraud) return DrawTriangles(state, vertices, count);
+        const std::uint32_t n = std::uint32_t(count);
+        Op(kDrawSame, sizeof n + n * sizeof(GsVertex));
+        Put(&n, sizeof n);
         Put(vertices, n * sizeof(GsVertex));
         End();
     }
@@ -87,18 +111,19 @@ public:
     // Answered from what the queue has made by then (the images known),
     // made in turn; the renderer's own answer counted when it differs.
     bool TargetToMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t cols,
-                        std::uint32_t rows, std::uint32_t first_row) override {
+                        std::uint32_t rows, std::uint32_t first_row, std::uint32_t first_col) override {
         const std::uint32_t known = targets_.count(TargetKey(fbp, fbw, psm)) ? 1 : 0;
-        const std::uint32_t a[7] = {fbp, fbw, psm, cols, rows, first_row, known};
+        const std::uint32_t a[8] = {fbp, fbw, psm, cols, rows, first_row, known, first_col};
         Op(kTargetToMemory, sizeof a);
         Put(a, sizeof a);
         End();
         return known != 0;
     }
     bool DepthToMemory(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::uint32_t fbw,
-                       std::uint32_t zpsm, std::uint32_t cols, std::uint32_t rows, std::uint32_t first_row) override {
+                       std::uint32_t zpsm, std::uint32_t cols, std::uint32_t rows, std::uint32_t first_row,
+                       std::uint32_t first_col) override {
         const std::uint32_t known = depths_.count(DepthKey(zbp, width, height)) ? 1 : 0;
-        const std::uint32_t a[9] = {zbp, width, height, fbw, zpsm, cols, rows, first_row, known};
+        const std::uint32_t a[10] = {zbp, width, height, fbw, zpsm, cols, rows, first_row, known, first_col};
         Op(kDepthToMemory, sizeof a);
         Put(a, sizeof a);
         End();
@@ -191,6 +216,12 @@ public:
         Put(&load, sizeof load);
         End();
     }
+    bool CanShuffle() const override { return inner_->CanShuffle(); }
+    void ChannelShuffle(const GsShuffle& shuffle) override {
+        Op(kChannelShuffle, sizeof shuffle);
+        Put(&shuffle, sizeof shuffle);
+        End();
+    }
     void ClutRows(const std::uint32_t* clut, std::uint32_t rows) override {
         Op(kClutRows, 4 + 1024);
         Put(&rows, 4);
@@ -204,9 +235,10 @@ public:
         End();
     }
     void TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t width,
-                              std::uint32_t height, std::uint32_t first_row, std::uint32_t rows) override {
+                              std::uint32_t height, std::uint32_t first_row, std::uint32_t rows,
+                              std::uint32_t first_col, std::uint32_t end_col) override {
         Made(fbp, fbw, psm, width, height);         // (made whole if it was not)
-        const std::uint32_t a[7] = {fbp, fbw, psm, width, height, first_row, rows};
+        const std::uint32_t a[9] = {fbp, fbw, psm, width, height, first_row, rows, first_col, end_col};
         Op(kTargetRowsFromMemory, sizeof a);
         Put(a, sizeof a);
         End();
@@ -229,6 +261,7 @@ public:
         if (inner_->Scale() != scale_) {            // every image dropped
             targets_.clear();
             depths_.clear();
+            last_target_ = last_depth_ = ~std::uint64_t(0);
         }
         scale_ = inner_->Scale();
     }
@@ -237,10 +270,11 @@ public:
         Drain(1);
         return inner_->UploadReplacement(id, format, width, height, levels, data, bytes);
     }
-    bool HasReplacement(std::uint64_t id) const override {
-        Drain(2);
-        return inner_->HasReplacement(id);
-    }
+    // Asked each draw of a replaced texture: the renderer's own answer, safe
+    // from here, not after the queue drains (that was half the GS thread
+    // with a texture pack). One evicted meanwhile is drawn once as the game
+    // has it - as the renderer does for any it no longer holds.
+    bool HasReplacement(std::uint64_t id) const override { return inner_->HasReplacement(id); }
     bool BlockCompression() const override {
         Drain(3);
         return inner_->BlockCompression();
@@ -284,7 +318,7 @@ private:
         kDraw, kDrawSame, kFlush, kKick, kUploadTexture, kUseReplacement, kUploadDepth, kUploadTarget,
         kReleaseTexture, kMemoryWrite, kMemoryPatch, kTargetFromMemory, kDepthFromMemory, kTextureFromMemory,
         kClutFromMemory, kClutRows, kReloadKeepsColour, kTargetRowsFromMemory, kDepthRowsFromMemory,
-        kTargetToMemory, kDepthToMemory,
+        kTargetToMemory, kDepthToMemory, kChannelShuffle,
     };
     // The images the queue has made by its end, as VulkanGsRenderer makes
     // them: a target by (FBP, FBW, PSM) at the size first asked for, a depth
@@ -462,6 +496,7 @@ private:
                     break;
                 }
                 case kClutFromMemory: r.ClutFromMemory(Take<GsClutLoad>(at)); break;
+                case kChannelShuffle: r.ChannelShuffle(Take<GsShuffle>(at)); break;
                 case kClutRows: {
                     const auto rows = Take<std::uint32_t>(at);
                     std::memcpy(clut_, at, sizeof clut_);
@@ -470,9 +505,9 @@ private:
                 }
                 case kReloadKeepsColour: r.ReloadKeepsColour(Take<std::uint32_t>(at) != 0); break;
                 case kTargetRowsFromMemory: {
-                    std::uint32_t a[7];
+                    std::uint32_t a[9];
                     std::memcpy(a, at, sizeof a);
-                    r.TargetRowsFromMemory(a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+                    r.TargetRowsFromMemory(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
                     break;
                 }
                 case kDepthRowsFromMemory: {
@@ -482,15 +517,15 @@ private:
                     break;
                 }
                 case kTargetToMemory: {
-                    std::uint32_t a[7];
+                    std::uint32_t a[8];
                     std::memcpy(a, at, sizeof a);
-                    if (r.TargetToMemory(a[0], a[1], a[2], a[3], a[4], a[5]) != (a[6] != 0)) ++wrong_;
+                    if (r.TargetToMemory(a[0], a[1], a[2], a[3], a[4], a[5], a[7]) != (a[6] != 0)) ++wrong_;
                     break;
                 }
                 case kDepthToMemory: {
-                    std::uint32_t a[9];
+                    std::uint32_t a[10];
                     std::memcpy(a, at, sizeof a);
-                    if (r.DepthToMemory(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]) != (a[8] != 0)) ++wrong_;
+                    if (r.DepthToMemory(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[9]) != (a[8] != 0)) ++wrong_;
                     break;
                 }
                 default: break;
@@ -503,6 +538,8 @@ private:
     std::uint32_t scale_ = 1;
     std::unordered_map<std::uint64_t, Size> targets_;
     std::unordered_set<std::uint64_t> depths_;
+    std::uint64_t last_target_ = ~std::uint64_t(0), last_depth_ = ~std::uint64_t(0);
+    Size last_made_{};
     std::atomic<unsigned> wrong_{0};
     // PS2HOST_GPU_THREAD_LOG: the waits for the queue, by what waited.
     static constexpr int kWhys = 14;
