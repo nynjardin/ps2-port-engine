@@ -127,6 +127,17 @@ std::vector<std::string> PlayArguments(const char* self) {
     // both: their lines in the order they were written.
     g_log = std::filesystem::path(exe).stem().string() + ".log";
     const std::string log = (here / g_log).string();
+    // The runs before stay readable: burnout3.log moves to burnout3.1.log, .1 to .2,
+    // and so on; the oldest of the five kept goes.
+    {
+        constexpr int kept = 5;
+        const std::string stem = std::filesystem::path(exe).stem().string();
+        const auto older = [&](int n) { return here / (stem + "." + std::to_string(n) + ".log"); };
+        std::error_code ignored;
+        std::filesystem::remove(older(kept), ignored);
+        for (int n = kept - 1; n >= 1; --n) std::filesystem::rename(older(n), older(n + 1), ignored);
+        std::filesystem::rename(log, older(1), ignored);
+    }
     std::FILE* stream = nullptr;
     freopen_s(&stream, "NUL", "w", stdout);    // streams with descriptors, in a windowed program
     freopen_s(&stream, "NUL", "w", stderr);
