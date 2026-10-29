@@ -68,10 +68,32 @@ public:
        all there is). */
     virtual void SetVsync(bool on) { (void)on; }
     virtual bool Vsync() const { return false; }
+    /* A variable refresh screen (G-Sync, FreeSync): without vertical sync,
+       each picture goes at once (IMMEDIATE, never MAILBOX - which shows at
+       the screen's highest refresh and drops pictures, uneven under VRR). */
+    virtual void SetVrr(bool on) { (void)on; }
+    virtual bool Vrr() const { return false; }
+    /* The GPU's clocks kept up while a game is light (NVIDIA's low-latency
+       boost, VK_NV_low_latency2, where the driver has it): from a loading
+       screen's idle clocks, a scene's first frames took half a second at a
+       tenth of the memory's speed - late pictures at every change of scene.
+       On by default; off saves power on a laptop's battery. */
+    virtual void SetGpuBoost(bool on) { (void)on; }
+    /* Whether the boost is on now: wanted, and the driver took it. */
+    virtual bool GpuBoosted() const { return false; }
 
     /* The refresh rate of the screen the window is on, in its present mode
        (fullscreen's own, EvenMode's), in Hz: 0 when not known. */
     virtual float RefreshRate() const { return 0.0f; }
+    /* The screen's refresh as measured (a thread waiting on each of its
+       vertical blanks, their times fitted to a line: vblank_fit.h): the
+       period, and the time of one of its blanks on the steady clock, in
+       nanoseconds. False when not known: not yet, no such screen found, or
+       blanks too uneven to say. */
+    virtual bool RefreshTiming(double* period_ns, std::uint64_t* blank_ns) const {
+        (void)period_ns, (void)blank_ns;
+        return false;
+    }
 
     /* The window's height in the screen's pixels (0 when not known). */
     virtual std::uint32_t PixelHeight() const { return 0; }
@@ -114,6 +136,8 @@ public:
        scancode (SDL_SCANCODE_*), which names keys by position. */
     virtual bool Focused() const = 0;
     virtual bool KeyDown(int scancode) const = 0;
+    /* Whether the window is minimised (nothing of it shown). */
+    virtual bool Minimized() const { return false; }
 
     /* The first game controller, as a DualShock 2 reads: false when none is
        plugged in. */
@@ -149,14 +173,20 @@ public:
     virtual void SetTriggerTargets(std::vector<std::uint32_t> ids) { (void)ids; }
     /* A controller's adaptive triggers (a DualSense's; others have none):
        off, a resistance from `start` (0-255 of the travel) of `force`
-       (0-255), or a vibration from `start` of `force` at `frequency` (Hz),
+       (0-255), or a vibration from `start` of `force` at `frequency` (Hz);
+       or by zones, the travel in ten: each zone's resistance (kZones), or
+       each zone's vibration at `frequency` (kZoneVibration), 0 none to 8 -
        until set again. Taken up by the window's own thread (Pump), and
        again when a controller is plugged in. */
     struct TriggerEffect {
-        enum Kind : std::uint8_t { kOff, kResistance, kVibration } kind = kOff;
+        enum Kind : std::uint8_t { kOff, kResistance, kVibration, kZones, kZoneVibration } kind = kOff;
         std::uint8_t start = 0, force = 0, frequency = 0;
+        std::uint8_t zones[10] = {};
         bool operator==(const TriggerEffect& o) const {
-            return kind == o.kind && start == o.start && force == o.force && frequency == o.frequency;
+            if (kind != o.kind || start != o.start || force != o.force || frequency != o.frequency) return false;
+            for (int i = 0; i < 10; ++i)
+                if (zones[i] != o.zones[i]) return false;
+            return true;
         }
     };
     virtual void SetTriggerEffects(TriggerEffect left, TriggerEffect right) { (void)left, (void)right; }
@@ -190,6 +220,19 @@ public:
        it was), or dropped unshown (shown_ns 0) - on the presenting thread. */
     using PresentObserver = std::function<void(std::uint64_t due_ns, std::uint64_t shown_ns, bool dropped)>;
     virtual void SetPresentObserver(PresentObserver observer) { (void)observer; }
+    /* Told the time of every present, paced or not (on the presenting
+       thread; set before the first). */
+    using ShownObserver = std::function<void(std::uint64_t shown_ns)>;
+    virtual void SetShownObserver(ShownObserver observer) { (void)observer; }
+    /* Told when each picture's GPU work was done - all drawn before its
+       present, and the present's own copy: from then the screen's next
+       refresh can show it - with the tag SetPresentTag gave it (the host:
+       its blank), on a thread of the display's own. A present untagged (0)
+       is not told. Set before the first. */
+    using GpuDoneObserver = std::function<void(std::uint64_t tag, std::uint64_t done_ns)>;
+    virtual void SetGpuDoneObserver(GpuDoneObserver observer) { (void)observer; }
+    /* The tag of the next present (PresentImage, on the thread that makes it). */
+    virtual void SetPresentTag(std::uint64_t tag) { (void)tag; }
 
     /* The GPU and driver, for the report. */
     virtual std::string Describe() const = 0;

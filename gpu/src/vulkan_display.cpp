@@ -6,10 +6,12 @@
  * which is cleared to black first. One frame is in flight: the fence is waited
  * before the staging buffer is written again. The swapchain presents in
  * MAILBOX mode where the driver has it (never blocking the emulation thread),
- * else IMMEDIATE, else FIFO, and is recreated when the window changes size.
+ * else IMMEDIATE, else FIFO (IMMEDIATE first on a VRR screen: SetVrr), and is
+ * recreated when the window changes size.
  */
 
 #include "ps2gpu/display.h"
+#include "ps2gpu/vblank_fit.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -29,6 +31,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <dxgi.h>
+#undef small            // rpcndr.h's, through the COM headers; SetRumble names a parameter so
+#pragma comment(lib, "dxgi.lib")
 #endif
 #include <atomic>
 #include <cctype>
@@ -39,6 +44,7 @@
 #include <cstring>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -47,6 +53,85 @@
 namespace ps2gpu {
 
 namespace {
+
+/* The screen's vertical blanks (RefreshTiming): a thread waits on each of
+   the window's screen's (DXGI's WaitForVBlank) and puts its time into the
+   fit. Shared with the thread, which the display leaves to end by itself (a
+   wait on a screen gone to sleep may not come back soon). */
+struct VblankWatch {
+    std::mutex lock;
+    VblankFit fit;
+    std::atomic<bool> stop{false};
+    std::atomic<float> nominal_hz{0.0f};        // the mode's refresh (Pump's)
+};
+
+std::uint64_t SteadyNs() {
+    return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+#ifdef _WIN32
+/* The DXGI output that shows `monitor`, on whichever adapter (a laptop's
+   built-in screen is the integrated GPU's); null if none. */
+IDXGIOutput* FindOutput(HMONITOR monitor) {
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) return nullptr;
+    IDXGIOutput* found = nullptr;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT a = 0; !found && factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+        IDXGIOutput* output = nullptr;
+        for (UINT o = 0; !found && adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
+            DXGI_OUTPUT_DESC desc;
+            if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == monitor) found = output;
+            else output->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return found;
+}
+
+void WatchVblanks(std::shared_ptr<VblankWatch> watch, HWND window) {
+    // Woken at each blank, to note its time: the sooner it runs, the closer.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    IDXGIOutput* output = nullptr;
+    HMONITOR on = nullptr;
+    unsigned looks = 0, quick = 0;
+    std::uint64_t before = 0;
+    while (!watch->stop.load(std::memory_order_relaxed)) {
+        // The window's screen, looked at again now and then (moved to another).
+        if (looks++ % 256 == 0 || !output) {
+            const HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+            if (monitor != on || !output) {
+                if (output) output->Release();
+                output = FindOutput(monitor);
+                on = monitor;
+                std::lock_guard<std::mutex> hold(watch->lock);
+                watch->fit.Reset();
+            }
+        }
+        if (!output || FAILED(output->WaitForVBlank())) {
+            if (output) output->Release();
+            output = nullptr;
+            Sleep(250);
+            continue;
+        }
+        const std::uint64_t now = SteadyNs();
+        // A wait that does not wait (a screen asleep): not a blank, and no spin.
+        if (now - before < 1'000'000) {
+            if (++quick > 8) Sleep(50);
+            before = now;
+            continue;
+        }
+        quick = 0;
+        before = now;
+        const float hz = watch->nominal_hz.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> hold(watch->lock);
+        watch->fit.Add(now, hz > 1.0f ? 1e9 / double(hz) : 0.0);
+    }
+    if (output) output->Release();
+}
+#endif
 
 class VulkanDisplay final : public Display {
 public:
@@ -121,7 +206,11 @@ public:
         return std::uint32_t(h > 0 ? h : 0);
     }
     bool Vsync() const override { return vsync_; }
+    void SetVrr(bool on) override;
+    bool Vrr() const override { return vrr_; }
     float RefreshRate() const override { return refresh_hz_.load(std::memory_order_relaxed); }
+    bool RefreshTiming(double* period_ns, std::uint64_t* blank_ns) const override;
+    std::shared_ptr<VblankWatch> vblank_watch_;     // RefreshTiming's (null: no such thread)
     void SetKeepRefresh(bool keep) override {
         if (keep_refresh_ == keep) return;
         keep_refresh_ = keep;
@@ -133,6 +222,9 @@ public:
     Pacing TakePacing() override;
     bool Focused() const override;
     bool KeyDown(int scancode) const override;
+    bool Minimized() const override {
+        return window_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_MINIMIZED) != 0;
+    }
     bool Pad(PadState* state) const override;
     std::string Describe() const override { return describe_; }
     Gpu* SharedGpu() override;
@@ -219,7 +311,31 @@ public:
         std::lock_guard<std::mutex> hold(paced_lock_);
         observer_ = std::move(observer);
     }
+    void SetShownObserver(ShownObserver observer) override {
+        std::lock_guard<std::mutex> hold(pacing_lock_);
+        shown_observer_ = std::move(observer);
+    }
+    ShownObserver shown_observer_;          // SetShownObserver (under pacing_lock_)
+    void SetGpuDoneObserver(GpuDoneObserver observer) override;
+    void SetPresentTag(std::uint64_t tag) override { present_tag_.store(tag); }
 private:
+    /* SetGpuDoneObserver's: after each tagged present an empty submit with
+       a fence of its own - signalled once all before it on the queue is
+       done - waited for by a thread that notes the time. Its fences its own
+       (a present's are reset by the next present). */
+    struct DoneWatch {
+        std::mutex lock;
+        std::condition_variable wake;
+        std::vector<std::pair<VkFence, std::uint64_t>> waiting;     // (fence, tag), oldest first
+        std::vector<VkFence> spare;
+        bool stop = false;
+        GpuDoneObserver observer;
+        std::thread thread;
+    };
+    std::unique_ptr<DoneWatch> done_watch_;
+    std::atomic<std::uint64_t> present_tag_{0};     // SetPresentTag's, taken by the next Submit
+    void WatchDone();
+    void StopDoneWatch();
     PresentObserver observer_;              // SetPresentObserver (under paced_lock_)
     // The mouse (TakeMouse), from the window's events; the picture's place in
     // the window, in pixels, as the last present put it.
@@ -275,6 +391,16 @@ private:
     VkFence fence_ = VK_NULL_HANDLE;
     VkPresentModeKHR mode_ = VK_PRESENT_MODE_FIFO_KHR;
     std::atomic<bool> vsync_{false};        // FIFO when set (SetVsync)
+    std::atomic<bool> vrr_{false};          // IMMEDIATE before MAILBOX when set (SetVrr)
+    // SetGpuBoost: VK_NV_low_latency2 enabled on the device (the driver has
+    // it), the boost wanted, and its call (the loader's, by name).
+    bool low_latency_ = false;
+    std::atomic<bool> boost_{true};
+    PFN_vkSetLatencySleepModeNV set_sleep_mode_ = nullptr;
+    void ApplyBoost();
+    void SetGpuBoost(bool on) override;
+    bool GpuBoosted() const override { return boosted_.load(std::memory_order_relaxed); }
+    std::atomic<bool> boosted_{false};      // ApplyBoost's: the driver took the boost
 
     VkBuffer staging_ = VK_NULL_HANDLE;
     VkDeviceMemory staging_memory_ = VK_NULL_HANDLE;
@@ -500,7 +626,19 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     qci.queueFamilyIndex = family_;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
-    const char* device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    const char* device_extensions[2] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, nullptr};
+    std::uint32_t device_extension_count = 1;
+    {
+        // NVIDIA's low latency (its boost: SetGpuBoost), where the driver has it.
+        std::uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(gpu_, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> offered(count);
+        vkEnumerateDeviceExtensionProperties(gpu_, nullptr, &count, offered.data());
+        for (const VkExtensionProperties& e : offered)
+            if (std::strcmp(e.extensionName, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) == 0) low_latency_ = true;
+        if (const char* env = std::getenv("PS2HOST_GPU_BOOST"); env && env[0] == '0') low_latency_ = false;
+        if (low_latency_) device_extensions[device_extension_count++] = VK_NV_LOW_LATENCY_2_EXTENSION_NAME;
+    }
     // What the GS renderer needs, for when it draws on this device
     // (SharedGpu): dynamic rendering, and dual-source blending if there is any.
     VkPhysicalDeviceFeatures supported;
@@ -518,9 +656,14 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     dci.pNext = &features;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
+    dci.enabledExtensionCount = device_extension_count;
     dci.ppEnabledExtensionNames = device_extensions;
     if (!Check(vkCreateDevice(gpu_, &dci, nullptr, &device_), "vkCreateDevice")) return false;
+    if (low_latency_) {
+        set_sleep_mode_ = reinterpret_cast<PFN_vkSetLatencySleepModeNV>(
+            vkGetDeviceProcAddr(device_, "vkSetLatencySleepModeNV"));
+        low_latency_ = set_sleep_mode_ != nullptr;
+    }
     // Device functions stay the loader's: see gpu.cpp.
     vkGetDeviceQueue(device_, family_, 0, &queue_);
 
@@ -545,7 +688,26 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     cmd_ = cmds_[0];
     acquired_ = acquireds_[0];
     fence_ = fences_[0];
+#ifdef _WIN32
+    // The screen's blanks, measured (RefreshTiming).
+    if (HWND hwnd = static_cast<HWND>(
+            SDL_GetPointerProperty(SDL_GetWindowProperties(window_), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr))) {
+        vblank_watch_ = std::make_shared<VblankWatch>();
+        std::thread(WatchVblanks, vblank_watch_, hwnd).detach();
+    }
+#endif
     return CreateSwapchain();
+}
+
+bool VulkanDisplay::RefreshTiming(double* period_ns, std::uint64_t* blank_ns) const {
+    if (!vblank_watch_) return false;
+    std::lock_guard<std::mutex> hold(vblank_watch_->lock);
+    const VblankFit& fit = vblank_watch_->fit;
+    // (Blanks no longer coming - the thread lost its screen: not known.)
+    if (!fit.Valid() || SteadyNs() > fit.Last() + 250'000'000) return false;
+    *period_ns = fit.Period();
+    *blank_ns = fit.Anchor();
+    return true;
 }
 
 bool VulkanDisplay::CreateSwapchain() {
@@ -574,9 +736,24 @@ bool VulkanDisplay::CreateSwapchain() {
     std::vector<VkPresentModeKHR> modes(n);
     vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &n, modes.data());
     mode_ = VK_PRESENT_MODE_FIFO_KHR;            // every device has it
+    // The last of these the driver has: MAILBOX first (no tearing on a
+    // fixed refresh), IMMEDIATE first on a VRR screen (SetVrr).
     if (!vsync_)
-        for (VkPresentModeKHR m : {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR})
+        for (VkPresentModeKHR m : vrr_ ? std::initializer_list<VkPresentModeKHR>{VK_PRESENT_MODE_MAILBOX_KHR,
+                                                                                VK_PRESENT_MODE_IMMEDIATE_KHR}
+                                       : std::initializer_list<VkPresentModeKHR>{VK_PRESENT_MODE_IMMEDIATE_KHR,
+                                                                                VK_PRESENT_MODE_MAILBOX_KHR})
             if (std::find(modes.begin(), modes.end(), m) != modes.end()) mode_ = m;
+    // (In a player's log when it changes: what a VRR screen was given.)
+    static VkPresentModeKHR logged = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    if (mode_ != logged) {
+        logged = mode_;
+        std::fprintf(stderr, "[display] presenting %s (vsync %s, vrr %s)\n",
+                     mode_ == VK_PRESENT_MODE_FIFO_KHR      ? "FIFO"
+                     : mode_ == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX"
+                                                            : "IMMEDIATE",
+                     vsync_ ? "on" : "off", vrr_ ? "on" : "off");
+    }
 
     VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     sci.surface = surface_;
@@ -593,10 +770,14 @@ bool VulkanDisplay::CreateSwapchain() {
     sci.presentMode = mode_;
     sci.clipped = VK_TRUE;
     sci.oldSwapchain = swapchain_;
+    VkSwapchainLatencyCreateInfoNV latency{VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV};
+    latency.latencyModeEnable = VK_TRUE;
+    if (low_latency_) sci.pNext = &latency;
     VkSwapchainKHR created = VK_NULL_HANDLE;
     if (!Check(vkCreateSwapchainKHR(device_, &sci, nullptr, &created), "vkCreateSwapchainKHR")) return false;
     DestroySwapchain();
     swapchain_ = created;
+    ApplyBoost();
     vkGetSwapchainImagesKHR(device_, swapchain_, &n, nullptr);
     images_.resize(n);
     vkGetSwapchainImagesKHR(device_, swapchain_, &n, images_.data());
@@ -1563,6 +1744,34 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
         std::lock_guard<std::mutex> hold(g_queue_lock);
         if (!Check(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit")) return false;
         r = vkQueuePresentKHR(queue_, &present);
+        // The GPU done with it: an empty submit's fence (after the copy, and
+        // all drawn before on this queue), for SetGpuDoneObserver.
+        const std::uint64_t tag = present_tag_.exchange(0);
+        if (done_watch_ && tag) {
+            VkFence watch = VK_NULL_HANDLE;
+            bool room = false;
+            {
+                std::lock_guard<std::mutex> hold(done_watch_->lock);
+                if (!done_watch_->spare.empty()) {
+                    watch = done_watch_->spare.back();
+                    done_watch_->spare.pop_back();
+                }
+                room = done_watch_->waiting.size() < 16;
+            }
+            if (!watch && room) {
+                VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+                vkCreateFence(device_, &fci, nullptr, &watch);
+            }
+            if (watch) {
+                if (vkQueueSubmit(queue_, 0, nullptr, watch) == VK_SUCCESS) {
+                    std::lock_guard<std::mutex> hold(done_watch_->lock);
+                    done_watch_->waiting.emplace_back(watch, tag);
+                    done_watch_->wake.notify_one();
+                } else {
+                    vkDestroyFence(device_, watch, nullptr);
+                }
+            }
+        }
     }
     {
         const auto now = std::chrono::steady_clock::now();
@@ -1580,6 +1789,9 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
         last_present_ = now;
         // The FPS counter's: presents counted over half a second at a time.
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) ++fps_presents_;
+        if (shown_observer_ && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR))
+            shown_observer_(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              now.time_since_epoch()).count()));
         const double counted = std::chrono::duration<double>(now - fps_since_).count();
         if (counted >= 0.5) {
             fps_.store(fps_since_.time_since_epoch().count() ? fps_presents_ / counted : 0.0);
@@ -1610,6 +1822,38 @@ void VulkanDisplay::SetVsync(bool on) {
     if (vsync_ == on) return;
     vsync_ = on;
     stale_ = true;                              // the swapchain again, with the other mode
+}
+
+/* The boost as wanted, on the swapchain (made again with each). Low latency
+   mode itself on with it - the boost asks for it - but its waits
+   (vkLatencySleepNV) never made: the pictures go as before. */
+void VulkanDisplay::ApplyBoost() {
+    if (!low_latency_ || !swapchain_) return;
+    VkLatencySleepModeInfoNV mode{VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV};
+    mode.lowLatencyMode = boost_ ? VK_TRUE : VK_FALSE;
+    mode.lowLatencyBoost = boost_ ? VK_TRUE : VK_FALSE;
+    mode.minimumIntervalUs = 0;
+    const VkResult r = set_sleep_mode_(device_, swapchain_, &mode);
+    boosted_ = boost_ && r == VK_SUCCESS;
+    static int said = -1;
+    if (said != int(boost_.load())) {
+        said = int(boost_.load());
+        std::fprintf(stderr, "[display] the GPU's low-latency boost %s%s\n", boost_ ? "on" : "off",
+                     r == VK_SUCCESS ? "" : " (the driver refused)");
+    }
+}
+
+void VulkanDisplay::SetGpuBoost(bool on) {
+    if (boost_ == on) return;
+    boost_ = on;
+    std::lock_guard<std::mutex> hold(present_lock_);
+    ApplyBoost();
+}
+
+void VulkanDisplay::SetVrr(bool on) {
+    if (vrr_ == on) return;
+    vrr_ = on;
+    if (!vsync_) stale_ = true;                 // (vertical sync's FIFO either way)
 }
 
 /* The display mode fullscreen takes: the desktop's resolution at a refresh
@@ -1679,6 +1923,7 @@ bool VulkanDisplay::Pump() {
         const SDL_DisplayID id = SDL_GetDisplayForWindow(window_);
         const SDL_DisplayMode* mode = id ? SDL_GetCurrentDisplayMode(id) : nullptr;
         refresh_hz_.store(mode ? mode->refresh_rate : 0.0f, std::memory_order_relaxed);
+        if (vblank_watch_) vblank_watch_->nominal_hz.store(mode ? mode->refresh_rate : 0.0f, std::memory_order_relaxed);
     }
     // Each controller's: the triggers' effects as last set, when they change
     // (off on one SetTriggerTargets leaves out), and the motors as the game
@@ -1946,12 +2191,32 @@ std::vector<Display::ControllerInfo> VulkanDisplay::Controllers() const {
    triggers' alone: their effects at 10 (right) and 21 (left), 11 bytes each,
    enabled by bits 2 and 3 of the first byte. An effect: its mode, then its
    parameters - 0x05 off; 0x01 resistance (start, force); 0x06 vibration
-   (frequency, amplitude, start). */
+   (frequency, amplitude, start); and by zones (the travel in ten), 0x21
+   resistance and 0x26 vibration: the zones on (a bit each, two bytes), then
+   each one's strength less 1 (3 bits each, four bytes), and for 0x26 the
+   frequency at +9. */
 void VulkanDisplay::SendTriggers(SDL_Gamepad* pad, const TriggerEffect& left, const TriggerEffect& right) {
     if (!pad || SDL_GetGamepadType(pad) != SDL_GAMEPAD_TYPE_PS5) return;
     std::uint8_t packet[47] = {};
     packet[0] = 0x04 | 0x08;
     auto put = [](std::uint8_t* at, const TriggerEffect& t) {
+        if (t.kind == TriggerEffect::kZones || t.kind == TriggerEffect::kZoneVibration) {
+            std::uint32_t on = 0, strengths = 0;
+            for (int i = 0; i < 10; ++i)
+                if (t.zones[i]) {
+                    on |= 1u << i;
+                    strengths |= std::uint32_t((std::min<int>(t.zones[i], 8) - 1) & 7) << (3 * i);
+                }
+            if (!on || (t.kind == TriggerEffect::kZoneVibration && !t.frequency)) {
+                at[0] = 0x05;
+                return;
+            }
+            at[0] = t.kind == TriggerEffect::kZones ? 0x21 : 0x26;
+            at[1] = std::uint8_t(on), at[2] = std::uint8_t(on >> 8);
+            for (int i = 0; i < 4; ++i) at[3 + i] = std::uint8_t(strengths >> (8 * i));
+            if (t.kind == TriggerEffect::kZoneVibration) at[9] = t.frequency;
+            return;
+        }
         switch (t.kind) {
             case TriggerEffect::kResistance:
                 at[0] = 0x01, at[1] = t.start, at[2] = t.force;
@@ -1987,7 +2252,56 @@ bool VulkanDisplay::KeyDown(int scancode) const {
     return keys && scancode >= 0 && scancode < n && keys[scancode];
 }
 
+void VulkanDisplay::SetGpuDoneObserver(GpuDoneObserver observer) {
+    if (done_watch_ || !observer) return;
+    done_watch_ = std::make_unique<DoneWatch>();
+    done_watch_->observer = std::move(observer);
+    done_watch_->thread = std::thread([this] { WatchDone(); });
+}
+
+void VulkanDisplay::WatchDone() {
+    DoneWatch& w = *done_watch_;
+    while (true) {
+        std::pair<VkFence, std::uint64_t> next;
+        {
+            std::unique_lock<std::mutex> hold(w.lock);
+            w.wake.wait(hold, [&] { return w.stop || !w.waiting.empty(); });
+            if (w.waiting.empty()) return;
+            next = w.waiting.front();
+        }
+        // (A tenth of a second at a time: stopped meanwhile, it goes.)
+        VkResult r = VK_TIMEOUT;
+        while ((r = vkWaitForFences(device_, 1, &next.first, VK_TRUE, 100'000'000)) == VK_TIMEOUT) {
+            std::lock_guard<std::mutex> hold(w.lock);
+            if (w.stop) return;
+        }
+        const std::uint64_t done = std::uint64_t(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        vkResetFences(device_, 1, &next.first);
+        {
+            std::lock_guard<std::mutex> hold(w.lock);
+            w.waiting.erase(w.waiting.begin());
+            w.spare.push_back(next.first);
+        }
+        if (r == VK_SUCCESS) w.observer(next.second, done);
+    }
+}
+
+void VulkanDisplay::StopDoneWatch() {
+    if (!done_watch_) return;
+    {
+        std::lock_guard<std::mutex> hold(done_watch_->lock);
+        done_watch_->stop = true;
+    }
+    done_watch_->wake.notify_all();
+    if (done_watch_->thread.joinable()) done_watch_->thread.join();
+    for (auto& [fence, tag] : done_watch_->waiting) vkDestroyFence(device_, fence, nullptr);
+    for (VkFence fence : done_watch_->spare) vkDestroyFence(device_, fence, nullptr);
+    done_watch_.reset();
+}
+
 VulkanDisplay::~VulkanDisplay() {
+    if (vblank_watch_) vblank_watch_->stop = true;      // (its thread ends at its next blank)
     {
         std::lock_guard<std::mutex> hold(paced_lock_);
         stop_ = true;
@@ -1996,6 +2310,7 @@ VulkanDisplay::~VulkanDisplay() {
     if (present_thread_.joinable()) present_thread_.join();
     shared_.reset();
     if (device_) vkDeviceWaitIdle(device_);
+    StopDoneWatch();
     DestroyPaced();
     if (copy_pool_) vkDestroyCommandPool(device_, copy_pool_, nullptr);
     DestroyPicture();

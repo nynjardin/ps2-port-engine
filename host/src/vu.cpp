@@ -159,15 +159,11 @@ std::unordered_map<std::uint64_t, std::vector<const VuCompiled*>>& Compiled() {
 }
 
 // A program's blocks by pair address (null where none starts), made once.
-const std::vector<VuBlock>& BlockTable(const VuCompiled* program, std::size_t pairs, bool fast, bool native) {
+const std::vector<VuBlock>& BlockTable(const VuCompiled* program, std::size_t pairs, bool fast) {
     // A thread's own (VU1 runs on VIF1's worker, VU0 on the EE's).
-    thread_local std::unordered_map<const VuCompiled*, std::vector<VuBlock>> tables[3];
-    // --vu-fast's blocks where asked for, else the native ones, else exact.
-    const VuBlock* blocks = fast && program->fast_blocks     ? program->fast_blocks
-                          : native && program->native_blocks ? program->native_blocks
-                                                             : program->blocks;
-    std::vector<VuBlock>& table =
-        tables[blocks == program->blocks ? 0 : blocks == program->fast_blocks ? 1 : 2][program];
+    thread_local std::unordered_map<const VuCompiled*, std::vector<VuBlock>> tables[2];
+    const VuBlock* blocks = fast && program->fast_blocks ? program->fast_blocks : program->blocks;
+    std::vector<VuBlock>& table = tables[blocks == program->blocks ? 0 : 1][program];
     if (table.empty()) {
         table.assign(pairs, nullptr);
         for (std::uint32_t i = 0; i < program->block_count; ++i)
@@ -286,13 +282,37 @@ void Vu::RecordPrograms(const std::string& path) {
 }
 
 bool Vu::SameState(const Vu& o, bool flags) const {
+    // PS2HOST_VU_SAY_DIFF: what differs, on stderr (the host tests' failures).
+    static const bool say = std::getenv("PS2HOST_VU_SAY_DIFF") != nullptr;
+    if (say) {
+        for (int r = 0; r < 32; ++r)
+            for (int lane = 0; lane < 4; ++lane) {
+                if (regs.vf[r][lane] != o.regs.vf[r][lane]) std::fprintf(stderr, "  vf%d.%d %08X %08X\n", r, lane, regs.vf[r][lane], o.regs.vf[r][lane]);
+                if (std::max(vf_ready_[r][lane], cycle_) != std::max(o.vf_ready_[r][lane], o.cycle_))
+                    std::fprintf(stderr, "  ready vf%d.%d %llu %llu (cycles %llu %llu)\n", r, lane,
+                                 (unsigned long long)vf_ready_[r][lane], (unsigned long long)o.vf_ready_[r][lane],
+                                 (unsigned long long)cycle_, (unsigned long long)o.cycle_);
+            }
+        for (int r = 0; r < 32; ++r)
+            if (regs.vc[r] != o.regs.vc[r]) std::fprintf(stderr, "  vc%d %X %X\n", r, regs.vc[r], o.regs.vc[r]);
+        if (cycle_ != o.cycle_) std::fprintf(stderr, "  cycle %llu %llu\n", (unsigned long long)cycle_, (unsigned long long)o.cycle_);
+        if (mac != o.mac || status != o.status || clip != o.clip) std::fprintf(stderr, "  flags\n");
+        if (std::memcmp(data.data(), o.data.data(), data.size())) std::fprintf(stderr, "  data\n");
+        if (resume != o.resume) std::fprintf(stderr, "  resume %X %X\n", resume, o.resume);
+    }
     auto same = [](const void* a, const void* b, std::size_t n) { return std::memcmp(a, b, n) == 0; };
     if (!same(regs.vf, o.regs.vf, sizeof regs.vf) || !same(regs.vc, o.regs.vc, sizeof regs.vc) ||
         !same(regs.vacc, o.regs.vacc, sizeof regs.vacc))
         return false;
     if ((flags && (mac != o.mac || status != o.status)) || clip != o.clip || p != o.p || resume != o.resume)
         return false;
-    if (cycle_ != o.cycle_ || !same(vf_ready_, o.vf_ready_, sizeof vf_ready_) || q_next_ != o.q_next_ ||
+    // Landing times as far as they can still stall: past ones are all alike
+    // (compiled code leaves out the times nothing reads - vurecomp's
+    // untimed_writes - and a time left out stays an earlier, past one).
+    for (int r = 0; r < 32; ++r)
+        for (int lane = 0; lane < 4; ++lane)
+            if (std::max(vf_ready_[r][lane], cycle_) != std::max(o.vf_ready_[r][lane], o.cycle_)) return false;
+    if (cycle_ != o.cycle_ || q_next_ != o.q_next_ ||
         p_next_ != o.p_next_ || q_ready_ != o.q_ready_ || p_ready_ != o.p_ready_ || q_busy_ != o.q_busy_ ||
         p_busy_ != o.p_busy_)
         return false;
@@ -341,12 +361,17 @@ Vu::u32* Vu::Quad(u32 address) {
 
 void Vu::Kick(u32 address) {
     ++kicks_;
+    // Data memory's size wraps the address, as the VU does: the runs below
+    // are counted from it (an address past the end ran them past the memory).
+    address &= data_mask_;
     for (int packets = 0; packets < 4096; ++packets) {
         const u32* tag = Quad(address);
         const u64 low = u64(tag[0]) | u64(tag[1]) << 32, high = u64(tag[2]) | u64(tag[3]) << 32;
         const u32 nloop = u32(low & 0x7FFF), eop = u32(low >> 15) & 1, flg = u32(low >> 58) & 3;
         const u32 nreg = u32(low >> 60) ? u32(low >> 60) : 16;
         const u32 qwords = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+        if (accesses)
+            for (u32 i = 0; i <= qwords; ++i) accesses->Read((address + i) & data_mask_, 0xF);
         if (on_kick_block) {
             // The tag and its data, in runs up to where data memory wraps.
             for (u32 left = 1 + qwords; left;) {
@@ -450,13 +475,17 @@ void Vu::Lower(u32 word, u32 pc, Pending& out, u32* branch) {
     const u32 it = Field(word, 16, 5), is = Field(word, 11, 5);
     u32* vi = regs.vc;
     auto setvi = [&](u32 r, u32 v) { if (r > 0 && r < 16) vi[r] = v & 0xFFFF; };
+    // The first field set in dest: what ILW and ILWR read.
+    const u32 first_lane = dest & 8 ? 8 : dest & 4 ? 4 : dest & 2 ? 2 : dest & 1 ? 1 : 0;
     auto load = [&](u32 address) {
+        if (accesses) accesses->Read(address & data_mask_, dest);
         const u32* q = Quad(address);
         out.vf = int(it);
         out.lanes = dest;
         std::memcpy(out.value, q, 16);
     };
     auto store = [&](u32 address, const u32* v) {
+        if (accesses) accesses->Write(address & data_mask_, dest);
         u32* q = Quad(address);
         for (int lane = 0; lane < 4; ++lane)
             if (dest & (8u >> lane)) q[lane] = v[lane];
@@ -514,12 +543,14 @@ void Vu::Lower(u32 word, u32 pc, Pending& out, u32* branch) {
                 case 0x36: setvi(is, vi[is] - 1); load(vi[is]); return;                 // LQD
                 case 0x37: setvi(it, vi[it] - 1); store(vi[it], regs.vf[is]); return;   // SQD
                 case 0x3E: {                                                            // ILWR
+                    if (accesses) accesses->Read(vi[is] & data_mask_, first_lane);
                     const u32* q = Quad(vi[is]);
                     for (int lane = 0; lane < 4; ++lane)
                         if (dest & (8u >> lane)) { setvi(it, q[lane]); break; }
                     return;
                 }
                 case 0x3F: {                                                            // ISWR
+                    if (accesses) accesses->Write(vi[is] & data_mask_, dest);
                     u32* q = Quad(vi[is]);
                     for (int lane = 0; lane < 4; ++lane)
                         if (dest & (8u >> lane)) q[lane] = vi[it] & 0xFFFF;
@@ -563,12 +594,14 @@ void Vu::Lower(u32 word, u32 pc, Pending& out, u32* branch) {
         case 0x00: load(vi[is] + u32(Imm11(word))); return;                     // LQ
         case 0x01: store(vi[it] + u32(Imm11(word)), regs.vf[is]); return;       // SQ
         case 0x04: {                                                             // ILW
+            if (accesses) accesses->Read((vi[is] + u32(Imm11(word))) & data_mask_, first_lane);
             const u32* q = Quad(vi[is] + u32(Imm11(word)));
             for (int lane = 0; lane < 4; ++lane)
                 if (dest & (8u >> lane)) { setvi(it, q[lane]); break; }
             return;
         }
         case 0x05: {                                                             // ISW
+            if (accesses) accesses->Write((vi[is] + u32(Imm11(word))) & data_mask_, dest);
             u32* q = Quad(vi[is] + u32(Imm11(word)));
             for (int lane = 0; lane < 4; ++lane)
                 if (dest & (8u >> lane)) q[lane] = vi[it] & 0xFFFF;
@@ -640,6 +673,7 @@ std::FILE* g_snapshots = nullptr;
 std::atomic<u64> g_snapshot_from{~u64(0)};
 std::atomic<bool> g_snapshotting{false};
 u32 g_snapshots_left = 0;
+std::atomic<u32> g_snapshots_written{0};     // runs written so far (the frames' marks)
 
 }  // namespace
 
@@ -654,10 +688,17 @@ void Vu::Snapshots(const std::string& path, u64 from, u32 count) {
 }
 
 void Vu::SnapshotFrame(u64 frame) {
-    if (g_snapshots && frame >= g_snapshot_from.load()) g_snapshotting = true;
+    if (g_snapshots && frame >= g_snapshot_from.load()) {
+        g_snapshotting = true;
+        // Where each frame begins among the runs (the EE's frame: the
+        // worker's runs may lag it by a little).
+        std::fprintf(stderr, "[vu-snapshot] frame %llu at run %u\n", (unsigned long long)frame,
+                     g_snapshots_written.load(std::memory_order_relaxed));
+    }
 }
 
-int Vu::Bench(const std::string& path, int passes, bool fast, bool native) {
+int Vu::Bench(const std::string& path, int passes, bool fast) {
+    if (std::getenv("PS2HOST_VU_DEPS")) return Dependencies(path);
     std::FILE* in = std::fopen(path.c_str(), "rb");
     if (!in) {
         std::fprintf(stderr, "vu: cannot read %s\n", path.c_str());
@@ -680,7 +721,6 @@ int Vu::Bench(const std::string& path, int passes, bool fast, bool native) {
     std::fclose(in);
     Vu vu(1);
     vu.fast = fast;
-    vu.native = native;
     vu.on_kick = [](u64, u64) {};
     vu.on_kick_block = [](const u32*, u32) {};
     // PS2HOST_VU_FIND=x,y,z,w (hex words): the run that leaves that quadword
@@ -897,6 +937,375 @@ struct VuRounding {
 };
 }  // namespace
 
+/* PS2HOST_VU_DEPS (vu.h, Dependencies). Each run of the snapshot, in order,
+   on the interpreter, from its own snapshot with the pipeline settled:
+   - data memory: the fields it reads before writing them itself (Accesses),
+     and the fields it writes;
+   - registers and flags: run again with one changed to random bits (twice);
+     where what it sends (XGKICK), leaves in memory or leaves in the other
+     registers differs, it read it. A register is written where it ends
+     other than it began (one left as it was needs no writer: its value is
+     the one before);
+   - between two runs, the fields of data memory that differ from where the
+     first left them are the VIF's (or the EE's): fresh, nobody's run.
+   A run depends on the runs that last wrote what it reads. Its weight: its
+   pairs. Reported: the runs that depend on none, the longest chain against
+   the whole, workers side by side (each run starting once what it needs is
+   done and a worker is free, in order), and what the edges are. */
+int Vu::Dependencies(const std::string& path) {
+    std::FILE* in = std::fopen(path.c_str(), "rb");
+    if (!in) {
+        std::fprintf(stderr, "vu: cannot read %s\n", path.c_str());
+        return 1;
+    }
+    struct Run {
+        Snapshot s;
+        std::vector<std::uint8_t> micro, data;
+    };
+    std::vector<Run> runs;
+    for (;;) {
+        Run r;
+        r.micro.resize(16384);
+        r.data.resize(16384);
+        if (std::fread(&r.s, sizeof r.s, 1, in) != 1 || std::fread(r.micro.data(), 1, 16384, in) != 16384 ||
+            std::fread(r.data.data(), 1, 16384, in) != 16384)
+            break;
+        runs.push_back(std::move(r));
+    }
+    std::fclose(in);
+    const std::size_t n = runs.size();
+    if (!n) return 1;
+
+    Vu vu(1);
+    vu.use_compiled = false;
+    u64 kick_hash = 0;
+    vu.on_kick = [](u64, u64) {};
+    vu.on_kick_block = [&kick_hash](const u32* words, u32 count) {
+        for (u32 i = 0; i < count; ++i) kick_hash = (kick_hash ^ words[i]) * 1099511628211ull;
+        kick_hash = (kick_hash ^ 0xFFFFFFFFu) * 1099511628211ull;      // where a block ends
+    };
+
+    // The registers and flags looked at, by index: VF1-31, VI1-15, ACC, R, I, Q, MAC, STATUS, CLIP, P.
+    enum { kVf = 0, kVi = 32, kAcc = 48, kR = 49, kI = 50, kQ = 51, kMac = 52, kStatus = 53, kClip = 54,
+           kP = 55, kRegs = 56 };
+    auto reg_name = [](int x) {
+        static const char* named[] = {"ACC", "R", "I", "Q", "MAC", "STATUS", "CLIP", "P"};
+        char text[16];
+        if (x < kVi) std::snprintf(text, sizeof text, "VF%02d", x);
+        else if (x < kAcc) std::snprintf(text, sizeof text, "VI%02d", x - kVi);
+        else return std::string(named[x - kAcc]);
+        return std::string(text);
+    };
+    auto valid_reg = [](int x) { return (x > kVf && x < kVi) || (x > kVi && x < kAcc) || (x >= kAcc && x < kRegs); };
+    // A register's value, as words (VF and ACC four, the rest one).
+    auto get = [](const Vu& v, int x, u32* out) -> int {
+        if (x < kVi) { std::memcpy(out, v.regs.vf[x], 16); return 4; }
+        if (x < kAcc) { out[0] = v.regs.vc[x - kVi]; return 1; }
+        switch (x) {
+            case kAcc: std::memcpy(out, v.regs.vacc, 16); return 4;
+            case kR: out[0] = v.regs.vc[20]; return 1;
+            case kI: out[0] = v.regs.vc[21]; return 1;
+            case kQ: out[0] = v.regs.vc[22]; return 1;
+            case kMac: out[0] = v.mac; return 1;
+            case kStatus: out[0] = v.status; return 1;
+            case kClip: out[0] = v.clip; return 1;
+            default: out[0] = v.p; return 1;
+        }
+    };
+    auto set = [](Vu& v, int x, const u32* in) {
+        if (x < kVi) std::memcpy(v.regs.vf[x], in, 16);
+        else if (x < kAcc) v.regs.vc[x - kVi] = in[0] & 0xFFFF;
+        else switch (x) {
+            case kAcc: std::memcpy(v.regs.vacc, in, 16); break;
+            case kR: v.regs.vc[20] = in[0]; break;
+            case kI: v.regs.vc[21] = in[0]; break;
+            case kQ: v.regs.vc[22] = in[0]; break;
+            case kMac: v.mac = v.mac_latest_ = in[0] & 0xFFFF; break;
+            case kStatus: v.status = v.status_latest_ = in[0] & 0xFFF; break;
+            case kClip: v.clip = v.clip_latest_ = in[0] & 0xFFFFFF; break;
+            default: v.p = in[0]; break;
+        }
+    };
+    const std::uint8_t* micro_now = nullptr;
+    // A run's snapshot loaded, the pipeline settled (nothing in flight, the
+    // latest flags the landed ones): every replay of it starts the same.
+    auto load = [&](const Run& r) {
+        if (micro_now != r.micro.data() && (!micro_now || std::memcmp(micro_now, r.micro.data(), 16384) != 0)) {
+            std::memcpy(vu.micro.data(), r.micro.data(), 16384);
+            vu.MicroWritten();
+        }
+        micro_now = r.micro.data();
+        std::memcpy(vu.data.data(), r.data.data(), 16384);
+        std::memcpy(vu.regs.vf, r.s.vf, sizeof r.s.vf);
+        std::memcpy(vu.regs.vc, r.s.vc, sizeof r.s.vc);
+        std::memcpy(vu.regs.vacc, r.s.vacc, sizeof r.s.vacc);
+        vu.mac = vu.mac_latest_ = r.s.flags[0];
+        vu.status = vu.status_latest_ = r.s.flags[1];
+        vu.clip = vu.clip_latest_ = r.s.flags[2];
+        vu.p = r.s.flags[3];
+        vu.top = r.s.flags[4];
+        vu.itop = r.s.flags[5];
+        vu.cycle_ = 0;
+        std::memset(vu.vf_ready_, 0, sizeof vu.vf_ready_);
+        vu.q_busy_ = vu.p_busy_ = false;
+        vu.q_ready_ = vu.p_ready_ = 0;
+        vu.qp_due_ = ~u64(0);
+        vu.flag_head_ = vu.flag_count_ = 0;
+        std::memset(vu.discarded_, 0, sizeof vu.discarded_);
+        kick_hash = 1469598103934665603ull;
+    };
+    struct Outcome {
+        u64 kicks = 0, pairs = 0;
+        std::vector<std::uint8_t> data;
+        u32 regs[kRegs][4] = {};
+    };
+    auto outcome = [&](u64 pairs) {
+        Outcome o;
+        o.kicks = kick_hash;
+        o.pairs = pairs;
+        o.data.assign(vu.data.data(), vu.data.data() + 16384);
+        for (int x = 0; x < kRegs; ++x)
+            if (valid_reg(x)) get(vu, x, o.regs[x]);
+        return o;
+    };
+
+    struct Tracker : Accesses {
+        std::uint8_t written[1024] = {}, read[1024] = {};
+        std::vector<u32> reads, writes;     // quad*4 + lane, each once
+        void Read(u32 q, u32 lanes) override {
+            for (u32 lane = 0; lane < 4; ++lane) {
+                const u32 bit = 8u >> lane;
+                if ((lanes & bit) && !(written[q] & bit) && !(read[q] & bit)) {
+                    read[q] |= bit;
+                    reads.push_back(q * 4 + lane);
+                }
+            }
+        }
+        void Write(u32 q, u32 lanes) override {
+            for (u32 lane = 0; lane < 4; ++lane) {
+                const u32 bit = 8u >> lane;
+                if ((lanes & bit) && !(written[q] & bit)) {
+                    written[q] |= bit;
+                    writes.push_back(q * 4 + lane);
+                }
+            }
+        }
+    };
+
+    u64 rng = 0x9E3779B97F4A7C15ull;
+    auto random = [&rng]() {
+        u64 z = (rng += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return u32(z ^ (z >> 31));
+    };
+
+    std::vector<int> mem_writer(4096, -1), reg_writer(kRegs, -1);
+    std::vector<std::vector<int>> deps(n);
+    std::vector<u64> weight(n);
+    std::map<std::string, u64> edge_kinds;       // what made an edge (a run's each reason once)
+    // Predicted: what a run reads from an earlier run, as its program's
+    // previous run began with (or, for a register, that value moved on by
+    // the step between its two before) - a worker could start with that and
+    // check it once the writer is done.
+    std::map<std::string, u64> edge_predicted;
+    std::map<std::string, u64> anomaly_kinds;
+    struct Start { Outcome now, before; int seen = 0; };
+    std::map<u32, Start> starts;
+    std::vector<std::vector<int>> hard(n);      // the edges not predicted
+    std::vector<std::map<int, std::string>> edge_reasons(n);
+    u64 reg_anomalies = 0, limited = 0, to_previous = 0;
+    const auto began = std::chrono::steady_clock::now();
+    const bool trace = std::getenv("PS2HOST_VU_DEPS")[0] == '2';
+    // PS2HOST_VU_DEPS_FLAGS=1: MAC and STATUS as a run leaves them compared too.
+    const bool keep_flags = std::getenv("PS2HOST_VU_DEPS_FLAGS") != nullptr;
+    for (std::size_t k = 0; k < n; ++k) {
+        const Run& r = runs[k];
+        if (trace) {
+            std::fprintf(stderr, "run %zu pc %X\n", k, unsigned(r.s.pc));
+            std::fflush(stderr);
+        }
+        Tracker track;
+        load(r);
+        vu.accesses = &track;
+        const u64 pairs = vu.Run(r.s.pc);
+        vu.accesses = nullptr;
+        const Outcome normal = outcome(pairs);
+        weight[k] = std::max<u64>(pairs, 1);
+        // Registers: written where they ended otherwise; read where changing them changes what it does.
+        bool reg_written[kRegs] = {}, reg_read[kRegs] = {};
+        load(r);
+        const Outcome before = outcome(0);
+        for (int x = 0; x < kRegs; ++x)
+            reg_written[x] = valid_reg(x) && std::memcmp(before.regs[x], normal.regs[x], 16) != 0;
+        for (int x = 0; x < kRegs; ++x) {
+            if (!valid_reg(x)) continue;
+            for (int trial = 0; trial < 2 && !reg_read[x]; ++trial) {
+                if (trace) {
+                    std::fprintf(stderr, "  %s %d\n", reg_name(x).c_str(), trial);
+                    std::fflush(stderr);
+                }
+                load(r);
+                u32 value[4] = {random(), random(), random(), random()};
+                set(vu, x, value);
+                const u64 got = vu.Run(r.s.pc, std::max<u64>(4 * pairs, 4096));
+                if (got >= std::max<u64>(4 * pairs, 4096)) ++limited;
+                const Outcome changed = outcome(got);
+                bool differs = changed.kicks != normal.kicks || changed.data != normal.data;
+                for (int y = 0; y < kRegs && !differs; ++y) {
+                    if (!valid_reg(y) || (y == x && !reg_written[x])) continue;
+                    if (!keep_flags && (y == kMac || y == kStatus)) continue;
+                    differs = std::memcmp(changed.regs[y], normal.regs[y], 16) != 0;
+                }
+                reg_read[x] = differs;
+            }
+        }
+        // The runs it depends on: the last writers of what it read.
+        std::map<int, std::vector<std::string>> why;
+        std::map<int, bool> missed;             // an edge's reads not all predicted
+        Start& last = starts[r.s.pc];
+        auto reg_predicted = [&](int x) {
+            if (last.seen < 1) return false;
+            if (std::memcmp(before.regs[x], last.now.regs[x], 16) == 0) return true;
+            if (last.seen >= 2 && std::memcmp(before.regs[x], last.before.regs[x], 16) == 0) return true;
+            if (last.seen < 2 || x < kVi || x >= kAcc) return false;
+            const u32 step = last.now.regs[x][0] - last.before.regs[x][0];
+            return ((last.now.regs[x][0] + step) & 0xFFFF) == before.regs[x][0];
+        };
+        std::map<int, std::pair<u64, u64>> mem_counts;    // writer: fields read, of them predicted
+        for (u32 field : track.reads) {
+            const int w = mem_writer[field];
+            if (w < 0) continue;
+            why[w].push_back("memory");
+            auto& [all, hit] = mem_counts[w];
+            ++all;
+            if ((last.seen >= 1 && std::memcmp(&before.data[field * 4], &last.now.data[field * 4], 4) == 0) ||
+                (last.seen >= 2 && std::memcmp(&before.data[field * 4], &last.before.data[field * 4], 4) == 0))
+                ++hit;
+        }
+        for (const auto& [w, counts] : mem_counts)
+            if (counts.second != counts.first) missed[w] = true;
+        for (int x = 0; x < kRegs; ++x)
+            if (reg_read[x] && reg_writer[x] >= 0) {
+                why[reg_writer[x]].push_back(reg_name(x));
+                if (reg_predicted(x)) ++edge_predicted[reg_name(x)];
+                else missed[reg_writer[x]] = true;
+            }
+        for (auto& [writer, reasons] : why) {
+            deps[k].push_back(writer);
+            if (missed[writer]) hard[k].push_back(writer);
+            if (writer == int(k) - 1) ++to_previous;
+            std::sort(reasons.begin(), reasons.end());
+            reasons.erase(std::unique(reasons.begin(), reasons.end()), reasons.end());
+            for (const std::string& reason : reasons) {
+                ++edge_kinds[reason];
+                std::string& joined = edge_reasons[k][writer];
+                joined += (joined.empty() ? "" : "+") + reason;
+            }
+        }
+        for (const auto& [w, counts] : mem_counts)
+            if (counts.second == counts.first) ++edge_predicted["memory"];
+        last.before = std::move(last.now);
+        last.now = before;
+        ++last.seen;
+        // What it leaves for the runs after.
+        for (u32 field : track.writes) mem_writer[field] = int(k);
+        for (int x = 0; x < kRegs; ++x)
+            if (reg_written[x]) reg_writer[x] = int(k);
+        // Between it and the next run: the VIF's (or the EE's) writes are nobody's run's.
+        if (k + 1 < n) {
+            const Run& next = runs[k + 1];
+            for (u32 q = 0; q < 1024; ++q)
+                for (u32 lane = 0; lane < 4; ++lane) {
+                    const std::size_t at = q * 16 + lane * 4;
+                    if (std::memcmp(&normal.data[at], &next.data[at], 4) != 0) mem_writer[q * 4 + lane] = -1;
+                }
+            load(next);
+            const Outcome then = outcome(0);
+            for (int x = 0; x < kRegs; ++x)
+                if (valid_reg(x) && std::memcmp(then.regs[x], normal.regs[x], 16) != 0) {
+                    ++reg_anomalies;
+                    ++anomaly_kinds[reg_name(x)];
+                    reg_writer[x] = -1;
+                }
+        }
+        if (k % 2000 == 1999)
+            std::fprintf(stderr, "vu-deps: %zu of %zu runs (%.0f s)\n", k + 1, n,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count());
+    }
+
+    // PS2HOST_VU_DEPS_OUT=file: the graph, a line a run - index, program, pairs;
+    // then each edge "writer:reasons" (reasons '+'-joined, '!' before a
+    // writer whose edge was not predicted).
+    if (const char* out_path = std::getenv("PS2HOST_VU_DEPS_OUT")) {
+        if (std::FILE* out = std::fopen(out_path, "w")) {
+            for (std::size_t k = 0; k < n; ++k) {
+                std::fprintf(out, "%zu %X %llu", k, unsigned(runs[k].s.pc), (unsigned long long)weight[k]);
+                for (int d : deps[k]) {
+                    const bool is_hard = std::find(hard[k].begin(), hard[k].end(), d) != hard[k].end();
+                    std::fprintf(out, " %s%d:%s", is_hard ? "!" : "", d, edge_reasons[k][d].c_str());
+                }
+                std::fprintf(out, "\n");
+            }
+            std::fclose(out);
+        }
+    }
+    std::printf("vu-deps: registers changed between runs, by register:");
+    for (const auto& [name, count] : anomaly_kinds) std::printf(" %s %llu", name.c_str(), (unsigned long long)count);
+    std::printf("\n");
+    std::printf("vu-deps: edges predicted (the program's previous start, or its step):");
+    for (const auto& [name, count] : edge_predicted)
+        std::printf(" %s %llu/%llu", name.c_str(), (unsigned long long)count, (unsigned long long)edge_kinds[name]);
+    std::printf("\n");
+    for (int pass = 0; pass < 2; ++pass) {
+    if (pass == 1) {
+        deps = hard;
+        std::printf("vu-deps: --- with the predicted edges gone ---\n");
+    }
+    // The schedule: the chain, and workers side by side in order.
+    u64 total = 0, free_runs = 0, free_pairs = 0;
+    std::vector<u64> finish(n);
+    u64 longest = 0;
+    for (std::size_t k = 0; k < n; ++k) {
+        total += weight[k];
+        u64 ready = 0;
+        for (int d : deps[k]) ready = std::max(ready, finish[d]);
+        if (deps[k].empty()) ++free_runs, free_pairs += weight[k];
+        finish[k] = ready + weight[k];
+        longest = std::max(longest, finish[k]);
+    }
+    std::printf("vu-deps: %zu runs, %llu pairs; %llu runs (%.1f%% of the pairs) depend on no earlier run\n", n,
+                (unsigned long long)total, (unsigned long long)free_runs, 100.0 * double(free_pairs) / double(total));
+    std::printf("vu-deps: the longest chain %llu pairs: at most %.2fx side by side\n", (unsigned long long)longest,
+                double(total) / double(longest));
+    for (int workers : {2, 3, 4, 6, 8}) {
+        std::vector<u64> free_at(workers, 0), done(n);
+        u64 end = 0;
+        for (std::size_t k = 0; k < n; ++k) {
+            u64 ready = 0;
+            for (int d : deps[k]) ready = std::max(ready, done[d]);
+            auto w = std::min_element(free_at.begin(), free_at.end());
+            const u64 start = std::max(ready, *w);
+            done[k] = start + weight[k];
+            *w = done[k];
+            end = std::max(end, done[k]);
+        }
+        std::printf("vu-deps: %d workers: %.2fx\n", workers, double(total) / double(end));
+    }
+    }
+    std::printf("vu-deps: edges to the run just before: %llu; registers changed between runs: %llu; "
+                "replays at their limit: %llu\n",
+                (unsigned long long)to_previous, (unsigned long long)reg_anomalies, (unsigned long long)limited);
+    std::vector<std::pair<u64, std::string>> kinds;
+    for (const auto& [kind, count] : edge_kinds) kinds.emplace_back(count, kind);
+    std::sort(kinds.rbegin(), kinds.rend());
+    std::printf("vu-deps: edges by what was read:");
+    for (std::size_t i = 0; i < kinds.size() && i < 16; ++i)
+        std::printf(" %s %llu", kinds[i].second.c_str(), (unsigned long long)kinds[i].first);
+    std::printf("\n");
+    return 0;
+}
+
 Vu::u64 Vu::Run(u32 pc, u64 limit) {
     Timed timed(data_mask_ == 0x3FF ? Section::Vu1 : Section::Vu0);
     VuRounding rounding;
@@ -915,6 +1324,7 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
         std::fwrite(&s, sizeof s, 1, g_snapshots);
         std::fwrite(micro.data(), 1, 16384, g_snapshots);
         std::fwrite(data.data(), 1, 16384, g_snapshots);
+        g_snapshots_written.fetch_add(1, std::memory_order_relaxed);
         if (--g_snapshots_left == 0) {
             std::fclose(g_snapshots);
             g_snapshots = nullptr;
@@ -926,10 +1336,23 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     unclean_ = ~1u;                     // nothing known about the registers yet
     acc_unclean_ = true;
     RunCompiled(state, limit);
+    const u64 compiled = state.count;
     if (!state.done) Interpret(state, limit);
     LandAll();
     resume = state.pc;
     pairs_ += state.count;
+    // A run far longer than a program's usual (a frame's whole VU1 work is a
+    // few million pairs): said, with how much of it the interpreter ran.
+    if (state.count >= (u64(1) << 21)) {
+        static int said = 0;
+        if (said < 20) {
+            ++said;
+            std::fprintf(stderr, "[vu] VU%d run from 0x%X: %llu pairs (%llu interpreted), ended at 0x%X%s\n", unit,
+                         unsigned(pc), (unsigned long long)state.count,
+                         (unsigned long long)(state.count - compiled), unsigned(state.pc),
+                         state.count >= limit ? " - its limit" : "");
+        }
+    }
     return state.count;
 }
 
@@ -939,12 +1362,11 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
     bool ran = false;
     // From program to program (a jump to a register's address may go to
     // another), as long as one starts here and its code is in memory.
-    while (!state.done && state.count < limit && state.delayed == kNone && !state.stopping) {
+    while (!state.done && !state.interpret && state.count < limit && state.delayed == kNone && !state.stopping) {
         Entered* entered = state.pc < micro.size() ? &entered_[state.pc / 8] : nullptr;
         const VuCompiled* program = nullptr;
         const std::vector<VuBlock>* blocks = nullptr;
-        if (entered && entered->generation == micro_generation_ && entered->fast == fast &&
-            entered->native == native) {
+        if (entered && entered->generation == micro_generation_ && entered->fast == fast) {
             program = static_cast<const VuCompiled*>(entered->program);
             blocks = static_cast<const std::vector<VuBlock>*>(entered->table);
         } else {
@@ -967,14 +1389,29 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
                 ++compiled_stale_;
                 break;
             }
-            blocks = &BlockTable(program, micro.size() / 8, fast, native);
-            if (entered) *entered = Entered{program, blocks, micro_generation_, fast, native};
+            blocks = &BlockTable(program, micro.size() / 8, fast);
+            if (entered) *entered = Entered{program, blocks, micro_generation_, fast};
         }
         ++compiled_entries_;
         const std::vector<VuBlock>& table = *blocks;
         const u64 before = state.count;
         const u32 started = state.pc;
-        while (!state.done && state.count < limit) {
+        while (!state.done && !state.interpret && state.count < limit) {
+            // A jump to a register's address: into a block that knows fields
+            // clean from the ways into it the generator knew, the interpreter
+            // goes on (that block's clamps were left out for them).
+            if (state.jumped) {
+                state.jumped = false;
+                if (program->knows) {
+                    const u32 pc = state.pc & u32(micro.size() - 1);
+                    const u32* end = program->starts + program->block_count;
+                    const u32* at = std::lower_bound(program->starts, end, pc);     // (in order of address)
+                    if (at != end && *at == pc && program->knows[at - program->starts]) {
+                        state.interpret = true;
+                        break;
+                    }
+                }
+            }
             const VuBlock block = table[(state.pc & u32(micro.size() - 1)) / 8];
             if (!block) break;
             const u64 at = state.count;

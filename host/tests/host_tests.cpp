@@ -18,7 +18,11 @@
 #include "ps2host/disc.h"
 #include "ps2host/dma.h"
 #include "ps2host/gs.h"
+#include "ps2host/bindings.h"
 #include "ps2host/host.h"
+#include "ps2host/hud.h"
+#include "ps2host/libnet.h"
+#include "ps2host/settings.h"
 #include "ps2host/run.h"
 #include "ps2host/ipu.h"
 #include "iop_vm_internal.h"
@@ -34,7 +38,9 @@
 
 #if PS2HOST_VULKAN
 #include "ps2gpu/gs_renderer.h"
+#include "ps2gpu/vblank_fit.h"
 #endif
+#include "ps2host/refresh_lock.h"
 
 /* vu_corpus.cpp (vurecomp.py --corpus, as the build goes): the random programs, compiled. */
 const ps2host::VuCompiled* VuGeneratedPrograms(std::size_t* count);
@@ -158,6 +164,22 @@ void DiscFindsFilesByPath() {
     Check(disc.ReadPattern(21, 1, 2, big.data()) && big[3] == 2 && std::memcmp(&big[12], "hello", 5) == 0,
           "an .iso's 2340-byte read has a made header");
     Check(!cd.Read(24, 1, sector), "reading past a raw image's end");
+
+    // Files laid over the disc: one replaced, one added to a directory, one
+    // in a directory of its own - the image untouched.
+    std::vector<u8> long_one(kSectorSize + 7, 0x5A);
+    disc.AddFile("FILE.BIN", long_one);
+    disc.AddFile("dir/added.dat", {'n', 'e', 'w'});
+    disc.AddFile("NEW/DEEP/MADE.BIN", {'m', 'a', 'd', 'e'});
+    std::vector<u8> got;
+    Check(disc.ReadFile("/FILE.BIN;1", &got) && got == long_one, "a file replaced, past a sector");
+    Check(disc.ReadFile("/DIR/ADDED.DAT", &got) && got == std::vector<u8>{'n', 'e', 'w'}, "a file added");
+    Check(disc.ReadFile("/dir/inner.dat", &got) && got.size() == 3, "the directory's own file still there");
+    Check(disc.ReadFile("/new/deep/made.bin", &got) && got == std::vector<u8>{'m', 'a', 'd', 'e'},
+          "a file in directories made for it");
+    Check(disc.Read(21, 1, sector) && std::memcmp(sector, "hello", 5) == 0, "the image's own sectors unchanged");
+    disc.Use(image);
+    Check(!disc.Find("/dir/added.dat", &file), "a new image has no overlay");
 }
 
 void BiosIsReadOnly() {
@@ -1086,7 +1108,11 @@ void VuCompiledIsTheInterpreter() {
             const u64 a = interpreted->Run(program.entry, limit), b = ahead->Run(program.entry, limit);
             ++runs;
             if (ahead->compiled_pairs()) ++entered;
-            if (a != b || !interpreted->SameState(*ahead)) ++wrong;
+            if (a != b || !interpreted->SameState(*ahead)) {
+                ++wrong;
+                std::fprintf(stderr, "[compiled] program %zu entry %X trial %d: pairs %llu %llu (PS2HOST_VU_SAY_DIFF: what)\n",
+                             i, program.entry, trial, (unsigned long long)a, (unsigned long long)b);
+            }
         }
     }
     char what[128];
@@ -1096,65 +1122,6 @@ void VuCompiledIsTheInterpreter() {
     // interpreter goes on there.)
     std::snprintf(what, sizeof what, "VU compiled programs taken where they are (%u of %u runs)", entered, runs);
     Check(entered == runs, what);
-}
-
-// --vu-native: the corpus's programs run their native blocks (vunative.py)
-// and end as the exact blocks do in everything - registers, memory, flags,
-// Q and P, every pipeline and cycle - and in the pairs counted.
-void VuNativeIsTheExact() {
-    std::size_t count = 0;
-    const ps2host::VuCompiled* programs = VuGeneratedPrograms(&count);
-    u32 seed = 4242;
-    u32 wrong = 0, runs = 0, native = 0;
-    for (std::size_t i = 0; i < count; ++i) {
-        const ps2host::VuCompiled& program = programs[i];
-        if (!program.block_count || !program.native_blocks) continue;
-        bool any = false;
-        for (u32 b = 0; b < program.block_count; ++b) any = any || program.native_blocks[b] != program.blocks[b];
-        for (int trial = 0; trial < 8; ++trial) {
-            auto exact = std::make_unique<ps2host::Vu>(program.unit);
-            auto fast = std::make_unique<ps2host::Vu>(program.unit);
-            const u32 start = seed;
-            for (ps2host::Vu* vu : {exact.get(), fast.get()}) {
-                seed = start;
-                PrepareVuRun(*vu, program, seed);
-            }
-            exact->native = false;
-            fast->native = true;
-            const u64 limit = 3000;
-            const u64 a = exact->Run(program.entry, limit), b = fast->Run(program.entry, limit);
-            ++runs;
-            if (any) ++native;
-            if (a != b || !exact->SameState(*fast)) {
-                if (++wrong <= 6) {
-                    std::fprintf(stderr, "[native] program %zu entry %X trial %d: pairs %llu %llu\n", i, program.entry,
-                                 trial, (unsigned long long)a, (unsigned long long)b);
-                    for (int r = 0; r < 32; ++r)
-                        for (int l = 0; l < 4; ++l)
-                            if (exact->regs.vf[r][l] != fast->regs.vf[r][l]) std::fprintf(stderr, "  vf%d.%d\n", r, l);
-                    for (int r = 0; r < 32; ++r)
-                        if (exact->regs.vc[r] != fast->regs.vc[r])
-                            std::fprintf(stderr, "  vc%d %X %X\n", r, exact->regs.vc[r], fast->regs.vc[r]);
-                    if (exact->regs.vacc[0] != fast->regs.vacc[0] || exact->regs.vacc[1] != fast->regs.vacc[1] ||
-                        exact->regs.vacc[2] != fast->regs.vacc[2] || exact->regs.vacc[3] != fast->regs.vacc[3])
-                        std::fprintf(stderr, "  acc\n");
-                    if (exact->mac != fast->mac || exact->status != fast->status || exact->clip != fast->clip)
-                        std::fprintf(stderr, "  flags %X %X %X / %X %X %X\n", exact->mac, exact->status, exact->clip,
-                                     fast->mac, fast->status, fast->clip);
-                    if (exact->p != fast->p) std::fprintf(stderr, "  p\n");
-                    if (std::memcmp(exact->data.data(), fast->data.data(), exact->data.size()))
-                        std::fprintf(stderr, "  data\n");
-                    if (exact->SameState(*fast, false) && (a == b)) std::fprintf(stderr, "  (MAC/STATUS or their pipeline)\n");
-                }
-            }
-        }
-    }
-    char what[160];
-    std::snprintf(what, sizeof what, "VU native blocks run as the exact ones (%u of %u runs differ)", wrong, runs);
-    Check(wrong == 0 && runs >= 100, what);
-    // None while vurecomp.py makes none (NATIVE): the exact blocks stand in.
-    std::snprintf(what, sizeof what, "VU native blocks taken (%u of %u runs)", native, runs);
-    Check(native == 0 || native > runs / 2, what);
 }
 
 // --vu-fast: the corpus's VU1 programs that never read MAC or STATUS
@@ -1177,7 +1144,6 @@ void VuFastIsTheExactButFlags() {
                 seed = start;
                 PrepareVuRun(*vu, program, seed);
             }
-            exact->native = fast->native = false;      // the exact blocks and their fast ones
             fast->fast = true;
             const u64 limit = 3000;
             const u64 a = exact->Run(program.entry, limit), b = fast->Run(program.entry, limit);
@@ -1851,7 +1817,242 @@ void OverlaysRunWhatIsLoaded() {
     ps2host::RegisterOverlays(nullptr, 0);
 }
 
+// The HUD's anchors: an element's key, its anchor from a setting or the
+// port's defaults (a key ending in '.' for every cell), and its placing.
+void HudAnchorsAndPlaces() {
+    namespace hud = ps2host::hud;
+    static const std::pair<const char*, hud::Anchor> defaults[] = {
+        {"hud.000010.000020.TL", hud::Anchor::kLeft},
+        {"hud.000010.000030.", hud::Anchor::kStretch},
+    };
+    hud::Game game;
+    game.defaults = defaults;
+    game.default_count = 2;
+    game.width = 512.0f;
+    hud::SetGame(game);
+    hud::ElementId id;
+    id.context = 0x10;
+    id.object = 0x20;
+    hud::CellOf(10.0f, 10.0f, id.cell);
+    Check(id.Key() == "hud.000010.000020.TL", "hud: an element's key names its context, object and cell");
+    Check(hud::AnchorOf(id) == hud::Anchor::kLeft && hud::AnchoringOf(id).given, "hud: a default anchor");
+    hud::ElementId other = id;
+    other.object = 0x30;
+    hud::CellOf(400.0f, 400.0f, other.cell);
+    Check(other.cell[0] == 'B' && other.cell[1] == 'R', "hud: a cell of the game's own picture (512 wide)");
+    Check(hud::AnchorOf(other) == hud::Anchor::kStretch, "hud: a default for the object in every cell");
+    hud::ElementId set = id;
+    set.object = 0x40;
+    ps2host::RunSetting(set.Key(), "right");
+    Check(hud::AnchorOf(set) == hud::Anchor::kRight, "hud: a setting's anchor");
+    set.object = 0x50;
+    Check(hud::AnchorOf(set) == hud::Anchor::kCentre && !hud::AnchoringOf(set).given, "hud: none named: centred");
+    Check(id < other && !(other < id), "hud: the editor's list goes top to bottom");
+    Check(hud::Place(100.0f, 320.0f, 320.0f, 0.75f, hud::Anchor::kCentre) == 155.0f, "hud: centred, brought in");
+    Check(hud::Place(100.0f, 320.0f, 320.0f, 0.75f, hud::Anchor::kLeft) == 75.0f, "hud: anchored left");
+    Check(hud::Place(600.0f, 320.0f, 320.0f, 0.75f, hud::Anchor::kRight) == 610.0f, "hud: anchored right");
+    Check(hud::Place(600.0f, 320.0f, 320.0f, 0.75f, hud::Anchor::kStretch) == 600.0f, "hud: stretched as drawn");
+    Check(hud::PlaceGs(0x8000 - 1600, 0x8000, 4096, 0.75f, hud::Anchor::kCentre) == 0x8000 - 1200,
+          "hud: GS units, rounded");
+    hud::SetGame(hud::Game{});
+}
+
+// libnet answered with the PC's sockets: two datagram sockets on the
+// loopback, one sending to the other, as a game's client wrappers call them
+// (client, buffer, then the arguments in a2, a3, t0..t3, the stack).
+void LibnetSendsDatagrams() {
+    namespace libnet = ps2host::libnet;
+    libnet::Client client;
+    client.create = 0x00510000u;
+    client.open = 0x00510100u;
+    client.close = 0x00510200u;
+    client.recv_from = 0x00510300u;
+    client.send_to = 0x00510400u;
+    libnet::Options options;
+    options.address_env = "PS2HOST_TEST_LAN_IP";
+    options.dump_env = nullptr;
+    _putenv_s("PS2HOST_TEST_LAN_IP", "127.0.0.1");
+    libnet::Register(client, options);
+    ps2host::Memory& m = ps2host::GuestMemory();
+    lifted::Context c{};
+    const auto call = [&](u32 at, std::initializer_list<u32> args) {
+        int i = 0;
+        for (u32 a : args) {
+            if (i < 6) c.r[6 + i] = a;
+            else m.Write(0x00520000u + u32(i - 6) * 4, a, 4);
+            ++i;
+        }
+        c.r[29] = 0x00520000u;
+        ps2host::Dispatch(c, at);
+        return s32(c.r[2]);
+    };
+    const u32 param = 0x00530000u, data = 0x00531000u, got = 0x00532000u, from = 0x00533000u;
+    const u32 kPortA = 39457, kPortB = 39458;
+    const auto create = [&](u32 port) {
+        for (u32 i = 0; i < 0x40; i += 4) m.Write(param + i, 0u, 4);
+        m.Write(param + 4, port, 4);                    // type 0 (datagram), the local port
+        return call(client.create, {param});
+    };
+    const s32 a = create(kPortA), b = create(kPortB);
+    Check(a > 0 && b > 0 && a != b, "libnet: sockets made");
+    Check(call(client.open, {u32(a), 0}) == 0 && call(client.open, {u32(b), 0}) == 0, "libnet: sockets opened");
+    const char hello[] = "hello";
+    for (u32 i = 0; i < 5; ++i) m.Write(data + i, u8(hello[i]), 1);
+    m.Write(from + 4, 0x7F000001u, 4);                  // 127.0.0.1, the EE's order
+    Check(call(client.send_to, {u32(a), data, 5, 0, from, kPortB, 0}) == 5, "libnet: a datagram sent");
+    s32 n = 0;
+    for (int tries = 0; tries < 200 && n <= 0; ++tries) {
+        n = call(client.recv_from, {u32(b), got, 64, 0, from, from + 0x20, 0});
+        if (n <= 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    bool same = n == 5;
+    for (u32 i = 0; same && i < 5; ++i) same = m.Read(got + i, 1) == u8(hello[i]);
+    Check(same, "libnet: the datagram received");
+    Check(m.Read(from + 4, 4) == 0x7F000001u && m.Read(from + 0x20, 4) == kPortA, "libnet: from whom, in the EE's order");
+    Check(call(client.recv_from, {u32(b), got, 64, 0, 0, 0, 0}) == 0, "libnet: nothing more: no wait");
+    Check(call(client.close, {u32(a), 0}) == 0 && call(client.close, {u32(b), 0}) == 0, "libnet: sockets closed");
+}
+
+// A player's bindings: the settings over the defaults, a binding taking its
+// key from the input that had it, and back to the settings as names.
+/* The timer locked to a screen (refresh_lock.h): the multiples, pulling in
+   to a 60 Hz screen from 59.94 and holding there, and giving up on a screen
+   whose refresh follows the pictures (VRR). */
+void BlanksLockToTheScreen() {
+    namespace rl = ps2host::refresh_lock;
+    Check(rl::Refreshes(16683000, 16666667) == 1 && rl::Refreshes(16683000, 8333333) == 2 &&
+              rl::Refreshes(16683000, 4166667) == 4 && rl::Refreshes(6944444, 6944000) == 1,
+          "refresh lock: whole multiples within half a percent");
+    Check(rl::Refreshes(8341500, 6944444) == 0 && rl::Refreshes(16683000, 6944444) == 0 &&
+              rl::Refreshes(16683000, 16000000) == 0,
+          "refresh lock: none where the rates do not divide");
+    Check(std::fabs(rl::Phase(16666667 + 1000, 16666667) - 1000) < 1 &&
+              std::fabs(rl::Phase(-1000, 16666667) + 1000) < 1,
+          "refresh lock: the phase, either side of a blank");
+    Check(std::fabs(rl::ToMiddle(1000, 10000) - 4000) < 1 && std::fabs(rl::ToMiddle(6000, 10000) - 9000) < 1,
+          "refresh lock: the next middle of a refresh");
+
+    // A 60 Hz screen whose blanks are 5 ms off the timer's, the game's 59.94.
+    const double screen = 1e9 / 60.0;
+    const std::uint64_t anchor = 5'000'000;
+    rl::Lock lock;
+    double next = 1e9;
+    double steps = 0;
+    int counted = 0;
+    for (int blank = 0; blank < 60 * 30; ++blank) {
+        const double step = lock.Step(16683000, std::uint64_t(next), true, screen, anchor);
+        next += step;
+        if (blank >= 60 * 20) steps += step, ++counted;
+    }
+    Check(lock.state() == rl::Lock::State::kLocked, "refresh lock: locked to a 60 Hz screen");
+    Check(std::fabs(rl::Phase(next - double(anchor), screen)) < 20'000,
+          "refresh lock: the blanks on the screen's (within 20 us)");
+    Check(std::fabs(steps / counted - screen) < 1.0, "refresh lock: a blank the screen's period");
+
+    // Knocked off (a stall): in again.
+    lock.Pull();
+    next += 4'000'000;
+    for (int blank = 0; blank < 60 * 10; ++blank) next += lock.Step(16683000, std::uint64_t(next), true, screen, anchor);
+    Check(lock.state() == rl::Lock::State::kLocked && std::fabs(rl::Phase(next - double(anchor), screen)) < 20'000,
+          "refresh lock: back on after a stall");
+
+    // A screen that is not known, or a rate that does not divide: the game's own.
+    Check(lock.Step(16683000, std::uint64_t(next), false, screen, anchor) == 16683000 &&
+              lock.state() == rl::Lock::State::kOff,
+          "refresh lock: off when the screen is not known");
+
+    // A lead: each blank 3 ms before one of the screen's (a picture done
+    // 2 ms after its blank, shown at once), then 9 ms at 144 (as the
+    // refreshes go: 2.06 ms) - taken up at the slew's pace, locked all along.
+    rl::Lock leading;
+    next = 1e9;
+    for (int blank = 0; blank < 60 * 20; ++blank)
+        next += leading.Step(16683000, std::uint64_t(next), true, screen, anchor, 3'000'000);
+    Check(leading.state() == rl::Lock::State::kLocked &&
+              std::fabs(rl::Phase(next + 3'000'000 - double(anchor), screen)) < 20'000,
+          "refresh lock: the blanks a lead before the screen's (within 20 us)");
+    rl::Lock fast;
+    const double screen144 = 1e9 / 144.0;
+    next = 1e9;
+    for (int blank = 0; blank < 144 * 10; ++blank)
+        next += fast.Step(6944444, std::uint64_t(next), true, screen144, anchor);
+    bool held = fast.state() == rl::Lock::State::kLocked;
+    for (int blank = 0; blank < 144 * 10; ++blank) {
+        next += fast.Step(6944444, std::uint64_t(next), true, screen144, anchor, 9'000'000);
+        held = held && fast.state() == rl::Lock::State::kLocked;
+    }
+    Check(held && std::fabs(rl::Phase(next + 9'000'000 - double(anchor), screen144)) < 20'000,
+          "refresh lock: a new lead taken up, locked throughout");
+
+    // A VRR screen: its blank 7 ms after each of the timer's, whatever the timer does.
+    rl::Lock follower;
+    next = 1e9;
+    for (int blank = 0; blank < 144 * 15; ++blank) {
+        const double step = follower.Step(6944444, std::uint64_t(next), true, 6944444, std::uint64_t(next) + 7'000'000);
+        next += step;
+    }
+    Check(follower.state() == rl::Lock::State::kGaveUp, "refresh lock: gives up on a screen that follows");
+    Check(follower.Step(6944444, std::uint64_t(next), true, 6944444, std::uint64_t(next) + 7'000'000) == 6944444,
+          "refresh lock: given up, the game's own blank");
+
+#if PS2HOST_VULKAN
+    // The blanks as a thread sees them: 144 Hz on a clock 40 ppm off, each
+    // seen up to 0.1 ms late, every 37th missed, one 3 ms late.
+    ps2gpu::VblankFit fit;
+    const double period = 1e9 / 144.0 * (1.0 + 40e-6);
+    const double start = 5e9 + 123456;
+    unsigned seed = 12345;
+    for (int n = 0; n < 600; ++n) {
+        if (n % 37 == 36) continue;
+        seed = seed * 1103515245u + 12345u;
+        double late = double((seed >> 16) % 100000);
+        if (n == 300) late = 3'000'000;
+        fit.Add(std::uint64_t(start + period * n + late), 1e9 / 144.0);
+    }
+    Check(fit.Valid(), "vblank fit: valid");
+    Check(std::fabs(fit.Period() - period) < 200.0, "vblank fit: the period (within 0.2 us)");
+    Check(std::fabs(rl::Phase(double(fit.Anchor()) - start, period) - 50'000) < 40'000,
+          "vblank fit: a blank's time (within its wake-ups' lateness)");
+    // The screen's mode changed (60 Hz): again, and right.
+    for (int n = 0; n < 200; ++n) fit.Add(std::uint64_t(start + 1e10 + n * (1e9 / 60.0)), 1e9 / 60.0);
+    Check(fit.Valid() && std::fabs(fit.Period() - 1e9 / 60.0) < 50.0, "vblank fit: a new mode's period");
+#endif
+}
+
+void BindingsKeepAndSwap() {
+    namespace b = ps2host::bindings;
+    b::Table defaults{};
+    for (int i = 0; i < b::kInputs; ++i) defaults.physical[i] = 0;
+    defaults.physical[b::kCross] = 'X';
+    defaults.physical[b::kSquare] = 'Z';
+    ps2host::RunSetting(b::SettingKey(b::Device::kKeyboard, "test", b::kCircle), "LEFT SHIFT");
+    ps2host::RunSetting(b::SettingKey(b::Device::kKeyboard, "test", b::kSquare), "NONE");
+    ps2host::RunSetting(b::SettingKey(b::Device::kKeyboard, "test", b::kL1), "NOT A KEY");
+    b::Table t = b::Load(b::Device::kKeyboard, "test", defaults);
+    Check(t.physical[b::kCross] == 'X', "bindings: a default kept");
+    Check(t.physical[b::kCircle] == b::KeyByName("LEFT SHIFT") && t.physical[b::kCircle] != 0,
+          "bindings: a setting's key");
+    Check(t.physical[b::kSquare] == 0, "bindings: NONE");
+    Check(t.physical[b::kL1] == 0, "bindings: a name not known keeps the default");
+    b::Bind(t, b::kCircle, 'X');
+    Check(t.physical[b::kCircle] == 'X' && t.physical[b::kCross] == b::KeyByName("LEFT SHIFT"),
+          "bindings: the key's old input gets the bound one's");
+    b::Save(b::Device::kKeyboard, "test", t);
+    Check(ps2host::Setting(b::SettingKey(b::Device::kKeyboard, "test", b::kCross)) == "LEFT SHIFT" &&
+              ps2host::Setting(b::SettingKey(b::Device::kKeyboard, "test", b::kSelect)) == "NONE",
+          "bindings: saved as names");
+    Check(b::Same(b::Load(b::Device::kKeyboard, "test", defaults), t), "bindings: what was saved loads");
+    Check(std::string(b::ButtonName(b::kCross, b::Style::kXbox)) == "A" &&
+              std::string(b::ButtonName(b::kCross, b::Style::kPlayStation)) == "CROSS" &&
+              b::ButtonByName("TRIANGLE") == b::kTriangle && std::string(b::ButtonName(-1, b::Style::kXbox)) == "NONE",
+          "bindings: the buttons' names");
+}
+
 int main() {
+    BlanksLockToTheScreen();
+    BindingsKeepAndSwap();
+    HudAnchorsAndPlaces();
+    LibnetSendsDatagrams();
     OverlaysRunWhatIsLoaded();
     MirrorsReachTheSameRam();
     LoadsExtendAsTheEeDoes();
@@ -1884,7 +2085,6 @@ int main() {
     VuLanesAreTheModel();
     VuCompiledIsTheInterpreter();
     VuFastIsTheExactButFlags();
-    VuNativeIsTheExact();
     VuTimingIsVisible();
     VuFlagsOfAResultIntoVf0();
     VuMaxKeepsADenormal();

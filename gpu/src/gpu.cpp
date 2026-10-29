@@ -14,6 +14,8 @@
 namespace ps2gpu {
 
 void SetGpuWaitObserver(GpuWaitObserver observer) { g_wait_observer = observer; }
+void (*g_renderer_thread_start)() = nullptr;
+void SetRendererThreadStart(void (*start)()) { g_renderer_thread_start = start; }
 
 namespace {
 /* A GPU's preference: PS2HOST_GPU=<part of its name> (any case: "intel",
@@ -99,6 +101,12 @@ bool VulkanGpu::Init(std::string* error) {
     logic_op = supported.logicOp == VK_TRUE;
     features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
     bc = supported.textureCompressionBC == VK_TRUE;
+    features.features.samplerAnisotropy = supported.samplerAnisotropy;           // texture packs' samplers
+    if (supported.samplerAnisotropy) {
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(gpu, &properties);
+        anisotropy = properties.limits.maxSamplerAnisotropy;
+    }
     features.pNext = &v13;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features;

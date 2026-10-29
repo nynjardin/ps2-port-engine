@@ -50,6 +50,7 @@
 
 #include "ps2host/host.h"
 #include "ps2host/memory.h"
+#include "ps2host/bindings.h"
 #include "ps2host/run.h"
 
 namespace ps2host {
@@ -113,6 +114,19 @@ const std::pair<int, int> kKeys[] = {
     {0, VK_BACK}, {3, VK_RETURN}, {4, VK_UP}, {5, VK_RIGHT}, {6, VK_DOWN}, {7, VK_LEFT},
     {8, '1'}, {9, '3'}, {10, 'Q'}, {11, 'E'}, {12, 'V'}, {13, 'C'}, {14, 'X'}, {15, 'Z'},
 };
+
+/* kKeys as a bindings table: the context "game"'s defaults. */
+bindings::Table GameDefaults() {
+    bindings::Table t{};
+    for (int i = 0; i < bindings::kInputs; ++i) t.physical[i] = 0;
+    for (const auto& [input, key] : kKeys) t.physical[input] = key;
+    return t;
+}
+
+bindings::Table& GameTable() {
+    static bindings::Table table = bindings::Load(bindings::Device::kKeyboard, "game", GameDefaults());
+    return table;
+}
 
 // Scripted presses (--press): (input, first frame, last frame, pressure), and
 // the scripted controller pressing it (--press padN:..., N from 1), or 0: the
@@ -202,8 +216,11 @@ void PadData(u32 port, u8* data) {
             for (int i = 0; i < 16; ++i)
                 if (keys & (1u << i)) pressure[i] = 0xFF;
         } else {
-            for (const auto& [input, key] : kKeys)
-                if (Pressed(key)) keys |= u16(1u << input), pressure[input] = 0xFF;
+            // The engine's keys, as the player bound them (bindings.h's GameKeys).
+            const bindings::Table& table = GameTable();
+            for (int input = 0; input < bindings::kInputs; ++input)
+                if (table.physical[input] && Pressed(table.physical[input]))
+                    keys |= u16(1u << input), pressure[input] = 0xFF;
         }
     }
     buttons &= u16(~keys);
@@ -215,7 +232,7 @@ void PadData(u32 port, u8* data) {
     HostPadState scripted;
     if (Everyones(port))
         for (const Press& p : Script())
-            if (!p.device && g_frame >= p.from && g_frame <= p.to) {
+            if (!p.device && p.input < 16 && g_frame >= p.from && g_frame <= p.to) {
                 if (script_controller) {
                     scripted.buttons |= u16(1u << p.input);
                     if (p.input == 8) scripted.l2 = p.pressure;
@@ -303,6 +320,11 @@ void PadData(u32 port, u8* data) {
     // scripted press's its own. (Sticks read as 0 are pushed fully up and
     // left: with them there, the frontend saw input held and never a press.)
     for (u32 i = 2; i < 6; ++i) data[i] = controller ? pad.sticks[i - 2] : 0x80;
+    // Scripted sticks (--press rs_left@...): pushed fully that way.
+    if (Everyones(port))
+        for (const Press& p : Script())
+            if (!p.device && p.input >= 16 && g_frame >= p.from && g_frame <= p.to)
+                data[2 + (p.input - 16) / 2] = (p.input & 1) ? 0x00 : 0xFF;
     static const int kPressure[12] = {5, 7, 4, 6, 12, 13, 14, 15, 10, 11, 8, 9};
     for (u32 i = 0; i < 12; ++i) data[6 + i] = (buttons >> kPressure[i]) & 1 ? 0 : pressure[kPressure[i]];
     // SetPadHold: the report as it last was while the game will not step,
@@ -548,6 +570,14 @@ bool ScriptPress(const std::string& spec, u64 from, u64 to, u8 pressure) {
             Script().push_back({i, from, to, pressure, device});
             return true;
         }
+    // The sticks pushed fully one way: rs_left..ls_down (inputs 16-23).
+    static const char* const kSticks[8] = {"rs_right", "rs_left", "rs_down", "rs_up",
+                                           "ls_right", "ls_left", "ls_down", "ls_up"};
+    for (int i = 0; i < 8; ++i)
+        if (button == kSticks[i] && !device) {
+            Script().push_back({16 + i, from, to, pressure, device});
+            return true;
+        }
     return false;
 }
 
@@ -724,6 +754,19 @@ void SetPadHook(u16 (*hook)()) { g_pad_hook = hook; }
 
 void SetControllerFilter(void (*filter)(HostPadState* pad)) { g_controller_filter = filter; }
 void SetKeyboardMapper(u16 (*mapper)()) { g_keyboard_mapper = mapper; }
+
+namespace bindings {
+
+const Table& GameKeys() { return GameTable(); }
+
+void SetGameKey(int input, int vk) {
+    Bind(GameTable(), input, vk);
+    Save(Device::kKeyboard, "game", GameTable());
+}
+
+bool PortMapsKeyboard() { return g_keyboard_mapper != nullptr; }
+
+}  // namespace bindings
 
 namespace {
 struct MouseStep {

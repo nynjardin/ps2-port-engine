@@ -41,6 +41,13 @@ void SetSampleGsThread(bool on);
 bool SampleGsThread();
 /* --sample-vif1: on VIF1's worker (real time), where VU1 runs. */
 void SetSampleVif1Thread(bool on);
+/* The GPU renderer's own thread instead (--sample-renderer; a threaded renderer's). */
+void SetSampleRendererThread(bool on);
+bool SampleRendererThread();
+/* On the renderer's own thread as it starts: named, and its CPU time to be
+   read (RendererThreadCpuMs, milliseconds; 0 without one). */
+void NoteRendererThread();
+double RendererThreadCpuMs();
 bool SampleVif1Thread();
 /* A host crash (an access violation and the like, on any thread): its code,
    address and the stack by name, to stderr, before the process ends. */

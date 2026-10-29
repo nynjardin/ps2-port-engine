@@ -33,6 +33,7 @@
 #include <unordered_set>
 
 #include "gpu_internal.h"
+#include "effects.h"
 #include "gs_frag.h"
 #include "gs_frag_single.h"
 #include "gs_frag_blend.h"
@@ -58,9 +59,16 @@ struct PackedVertex {
     float s, t, q;
     std::uint32_t z;
     std::uint8_t fog, pad[3];
-    float range[4];             // a sprite's S, T at its first and last pixels (gs.vert)
-    float pad2[4];
 };
+// A sprite's S, T at its first and last pixels (gs.vert's `range`), in a
+// stream of its own: only a sprite or a flat quad on a target drawn larger
+// reads it (gs.frag's snap), so every other batch binds one value for all
+// its vertices (stride 0) - the vertex half the size it was with it inside,
+// half the bytes written, copied to the GPU and fetched there.
+struct VertexRange {
+    float range[4];
+};
+constexpr VertexRange kNoRange{{-1e9f, -1e9f, 1e9f, 1e9f}};
 // The vertex ring hands out 256-byte aligned runs, a batch's first vertex
 // found by its offset: whole vertices to 256 bytes.
 static_assert(256 % sizeof(PackedVertex) == 0, "a vertex must divide the ring's alignment");
@@ -92,6 +100,33 @@ public:
 
 private:
     std::unique_ptr<PackedVertex[]> data_;
+    std::size_t size_ = 0, capacity_ = 0;
+};
+
+/* A batch's ranges so far, in step with its vertices - kept only for a
+   batch that can read them (VulkanGsRenderer::RangesWanted). */
+class PendingRanges {
+public:
+    std::size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    void clear() { size_ = 0; }
+    VertexRange* data() { return data_.get(); }
+    VertexRange& operator[](std::size_t i) { return data_[i]; }
+    VertexRange* Grow(std::size_t n) {
+        if (size_ + n > capacity_) {
+            const std::size_t capacity = std::max<std::size_t>(capacity_ * 2, std::max<std::size_t>(size_ + n, 4096));
+            std::unique_ptr<VertexRange[]> data(new VertexRange[capacity]);
+            if (size_) std::memcpy(data.get(), data_.get(), size_ * sizeof(VertexRange));
+            data_ = std::move(data);
+            capacity_ = capacity;
+        }
+        VertexRange* at = data_.get() + size_;
+        size_ += n;
+        return at;
+    }
+
+private:
+    std::unique_ptr<VertexRange[]> data_;
     std::size_t size_ = 0, capacity_ = 0;
 };
 
@@ -154,6 +189,7 @@ struct Image {
     VkDescriptorSet sampled = VK_NULL_HANDLE;   /* a target read by the DATE setup pass */
     VkDescriptorSet storage = VK_NULL_HANDLE;   /* a target as the swizzle's storage image */
     VkImageView depth_view = VK_NULL_HANDLE;    /* a depth buffer's depth alone, to sample */
+    VkImageView stencil_view = VK_NULL_HANDLE;  /* ...and its stencil alone (bit 2: a car's paint) */
     VkDescriptorSet depth_sampled = VK_NULL_HANDLE;     /* ...for the swizzle */
 };
 
@@ -162,7 +198,7 @@ constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
 
 struct Texture {
     Image image;
-    VkDescriptorSet sets[8] = {};       /* by sampler */
+    VkDescriptorSet sets[28] = {};      /* by sampler (samplers_, then replacement_samplers_) */
     /* A texture drawn as a texture pack's replacement (UseReplacement): its
        id, 0 for none. A replacement itself (replacements_): gs.frag's
        tex_format for it - bit 8, levels - 1 in bits 9-11 - when it was last
@@ -397,7 +433,7 @@ bool SameBatch(const GsDrawState& x, const GsDrawState& y) {
     // Most primitives come with the very state of the one before (the
     // bridge's fast path): the same bytes are the same fields, at once.
     if (std::memcmp(&x, &y, sizeof x) == 0) return true;
-    return x.fbp == y.fbp && x.fbw == y.fbw && x.psm == y.psm && x.fbmsk == y.fbmsk && x.scissor_x0 == y.scissor_x0 &&
+    return x.tag == y.tag && x.fbp == y.fbp && x.fbw == y.fbw && x.psm == y.psm && x.fbmsk == y.fbmsk && x.scissor_x0 == y.scissor_x0 &&
            x.scissor_y0 == y.scissor_y0 && x.scissor_x1 == y.scissor_x1 && x.scissor_y1 == y.scissor_y1 &&
            x.textured == y.textured && (!x.textured || (x.texture == y.texture && x.tfx == y.tfx &&
            x.tcc == y.tcc && x.bilinear == y.bilinear && x.mip == y.mip && x.wms == y.wms && x.wmt == y.wmt && x.minu == y.minu &&
@@ -441,6 +477,11 @@ public:
         return targets_.count(Key{fbp, fbw, psm}) != 0;
     }
     void DrawTriangles(const GsDrawState& state, const GsVertex* vertices, std::size_t count) override;
+    void DrawTriangleRun(const GsDrawState& state, const GsVertex* vertices, std::size_t per,
+                         std::size_t prims) override;
+    /* The batch's vertices (and ranges, where it keeps them) for `count`
+       vertices, three a triangle, each with `range`. */
+    void Append(const GsDrawState& state, const GsVertex* v, std::size_t count, const float* range);
     void Flush() override;
     void Kick() override {
         Flush();
@@ -471,6 +512,7 @@ public:
     bool ReadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::vector<std::uint32_t>* z) override;
     std::uint32_t Scale() const override { return scale_; }
     void SetScale(std::uint32_t scale) override;
+    void SetScaleRule(std::uint32_t fbp_begin, std::uint32_t fbp_end, std::uint32_t max_fbw) override;
     void MemoryWrite(std::uint32_t begin, std::uint32_t end, const std::uint8_t* bytes) override;
     void MemoryRead(std::uint32_t begin, std::uint32_t end, std::uint8_t* bytes) override;
     void MemoryPatch(const std::uint32_t* words, std::size_t count) override;
@@ -488,6 +530,8 @@ public:
     void ClutRows(const std::uint32_t* clut, std::uint32_t rows) override;
     bool CanShuffle() const override { return shuffle_pipeline_ != VK_NULL_HANDLE; }
     void ChannelShuffle(const GsShuffle& shuffle) override;
+    bool CanRunEffects() const override { return effects_.ready(); }
+    void RunEffect(const GsEffect& effect) override;
     bool ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::vector<std::uint32_t>* pixels,
                     std::uint32_t* width, std::uint32_t* height) override;
     bool ReadTargetFull(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::vector<std::uint32_t>* pixels,
@@ -538,6 +582,8 @@ private:
        size, kept (one image resized in turn - the race alternates targets of
        several sizes - waited for the GPU each time: 32 s of a race script). */
     std::map<std::pair<std::uint32_t, std::uint32_t>, Image> feedbacks_;
+    /* A game has tagged its paint to be marked in the stencil (tag bit 3). */
+    bool paint_mask_ = false;
     Image* feedback_ = nullptr;     /* the one the batch being recorded copies into */
     /* A batch that samples its own target reads one copy, made as it begins;
        the GS reads each primitive's texels as the ones before it left them.
@@ -612,7 +658,12 @@ private:
        1024x256 over its glow's memory, read as PSMT8H, brought back from
        memory 18 times a splitscreen frame and never drawn into: at 3x its
        reloads were a third of the swizzles. */
-    std::uint32_t ScaleOf(std::uint32_t width) const { return width <= 320 || width >= 1024 ? 1u : scale_; }
+    std::uint32_t ScaleOf(std::uint32_t width, std::uint32_t fbp) const {
+        if (fbp >= rule_begin_ && fbp < rule_end_ && width <= rule_max_fbw_ * 64) return scale_;
+        return width <= 320 || width >= 1024 ? 1u : scale_;
+    }
+    std::uint32_t rule_begin_ = 0, rule_end_ = 0, rule_max_fbw_ = 0;       // SetScaleRule
+    void DropImages();
     Image* open_target_ = nullptr;
     Image* open_depth_ = nullptr;
     void EndPass(VkCommandBuffer cmd, PassEnd why = kEndOther) {
@@ -631,7 +682,18 @@ private:
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     bool keep_colour_ = false;      /* ReloadKeepsColour */
-    VkSampler samplers_[8] = {};    /* bilinear << 2 | clamp_s << 1 | clamp_t */
+    VkSampler samplers_[28] = {};   /* bilinear << 2 | clamp_s << 1 | clamp_t; from 8 a texture pack's
+                                       (ReplacementSampler) */
+    /* A texture pack's replacement, filtered by the GPU (gs.frag's
+       ReplacedSample): linear in and between its levels, CLAMP's REPEAT or
+       CLAMP each way (clamp_s << 1 | clamp_t) and 1, 2, 4, 8 or 16 taps of
+       anisotropy (the player's ANISOTROPIC: GsDrawState::tag bits 8-12) -
+       one of samplers_' from 8. */
+    static int ReplacementSampler(const GsDrawState& s) {
+        const int clamps = int((s.wms & 1u) << 1 | (s.wmt & 1u));
+        const int taps = ((s.tag >> 11) & 3u) == 3u ? int(std::min((s.tag >> 8) & 7u, 4u)) : 0;
+        return 8 + clamps * 5 + taps;
+    }
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     std::map<std::uint32_t, VkPipeline> pipelines_;
     std::uint32_t last_pipeline_key_ = ~0u;
@@ -677,6 +739,13 @@ private:
     Texture blank_;                 /* bound when nothing is textured */
     GsDrawState state_;
     PendingVertices pending_;
+    PendingRanges ranges_;          // empty, or as many as pending_ (RangesWanted)
+    /* Whether a batch can read its ranges: textured on a target drawn larger,
+       a sprite or a flat quad (DrawTriangles) - at the PS2's own resolution
+       none. */
+    bool RangesWanted(const GsDrawState& s) const {
+        return scale_ > 1 && s.textured && (s.sprite || !s.texture_target);
+    }
     /* Vertex data for what is recorded: appended to chunks of host-visible
        memory, all reusable once the submission that reads them has run. */
     struct VertexChunk {
@@ -739,12 +808,17 @@ private:
         std::uint64_t recording = ~0ull;
         VkPipeline pipeline = VK_NULL_HANDLE;
         VkDescriptorSet sets[2] = {};
+        VkDescriptorSet set2 = VK_NULL_HANDLE;     // gs.frag's set 2
         int depth_test = -1, stencil_test = -1, compare = -1, depth_write = -1;
         VkViewport viewport{};
         VkRect2D scissor{};
         float size[2] = {-1, -1};
         VkBuffer vertices = VK_NULL_HANDLE;
+        VkBuffer ranges = VK_NULL_HANDLE;   // bound for all the vertices (stride 0), with `vertices`
     } drawn_;
+    // kNoRange, for a batch whose ranges are read but keep nothing in.
+    VkBuffer no_range_ = VK_NULL_HANDLE;
+    VkDeviceMemory no_range_memory_ = VK_NULL_HANDLE;
     // The CLUT for the draws (gs.frag's set 1): a target read as PSMT8H.
     VkDescriptorSetLayout clut_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorSet clut_set_ = VK_NULL_HANDLE;
@@ -808,6 +882,39 @@ private:
     GsShuffle shuffle_wait_;
     std::int32_t shuffle_period_ = 0, shuffle_count_ = 0;
     void RecordShuffle();
+    /* The PC's effects (RunEffect, effects.cpp). */
+    GsEffects effects_{g_};
+    /* The scene's depth GsEffects saved, as gs.frag's set 2 (soft
+       particles): made again when its view changes; null for none. */
+    VkDescriptorSet scene_set_ = VK_NULL_HANDLE;
+    VkImageView scene_view_ = VK_NULL_HANDLE;
+    VkDescriptorSet SceneDepthSet() {
+        const VkImageView view = effects_.SceneDepth();
+        if (!view) return VK_NULL_HANDLE;
+        if (view == scene_view_ && scene_set_) return scene_set_;
+        if (!scene_set_) {
+            VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ai.descriptorPool = pool_;
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &set_layout_;
+            if (vkAllocateDescriptorSets(g_.device, &ai, &scene_set_) != VK_SUCCESS) return VK_NULL_HANDLE;
+        }
+        // (once the GPU is done with the set as it was: a scale's change, idle)
+        const VkDescriptorImageInfo info[2] = {
+            {samplers_[3], view, VK_IMAGE_LAYOUT_GENERAL},
+            {samplers_[3], blank_.image.words, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+        VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        for (int i = 0; i < 2; ++i) {
+            writes[i].dstSet = scene_set_;
+            writes[i].dstBinding = std::uint32_t(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &info[i];
+        }
+        vkUpdateDescriptorSets(g_.device, blank_.image.words ? 2 : 1, writes, 0, nullptr);
+        scene_view_ = view;
+        return scene_set_;
+    }
 };
 
 void* VulkanGsRenderer::Vertices(VkDeviceSize bytes, VkBuffer* buffer, VkDeviceSize* offset) {
@@ -973,14 +1080,21 @@ bool VulkanGsRenderer::MakeImage(Image& t, std::uint32_t width, std::uint32_t he
     if (format == kDepthFormat && (usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
         vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
         if (vkCreateImageView(g_.device, &vci, nullptr, &t.depth_view) != VK_SUCCESS) return false;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(g_.device, &vci, nullptr, &t.stencil_view) != VK_SUCCESS) return false;
     }
     return true;
 }
 
 void VulkanGsRenderer::DestroyImage(Image& t) {
+    effects_.ForgetView(t.view);
     if (t.view) vkDestroyImageView(g_.device, t.view, nullptr);
     if (t.words) vkDestroyImageView(g_.device, t.words, nullptr);
     if (t.depth_view) vkDestroyImageView(g_.device, t.depth_view, nullptr);
+    if (t.stencil_view) {
+        effects_.ForgetView(t.stencil_view);
+        vkDestroyImageView(g_.device, t.stencil_view, nullptr);
+    }
     if (t.image) vkDestroyImage(g_.device, t.image, nullptr);
     if (t.memory) FreeImageMemory(t.memory, t.offset, t.piece_class, t.memory_type);
     t = Image{};
@@ -1077,6 +1191,21 @@ bool VulkanGsRenderer::Init(std::string* error) {
         sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sci.maxLod = 0.0f;
         vkCreateSampler(g_.device, &sci, nullptr, &samplers_[i]);
+    }
+    for (int i = 0; i < 20; ++i) {              // ReplacementSampler's
+        const int clamps = i / 5, taps = 1 << (i % 5);
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sci.addressModeU = (clamps & 2) ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.addressModeV = (clamps & 1) ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = 16.0f;
+        if (taps > 1 && g_.anisotropy > 1.0f) {
+            sci.anisotropyEnable = VK_TRUE;
+            sci.maxAnisotropy = std::min(float(taps), g_.anisotropy);
+        }
+        vkCreateSampler(g_.device, &sci, nullptr, &samplers_[8 + i]);
     }
     VkPushConstantRange push[2] = {{VK_SHADER_STAGE_VERTEX_BIT, 0, 8},
                                    {VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset, sizeof(FragmentParams)}};
@@ -1260,6 +1389,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         return false;
     }
     MakeShufflePipeline();
+    effects_.Init(cache_);
     {
         VkShaderModuleCreateInfo pi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         pi.codeSize = sizeof spirv_patch_comp;
@@ -1763,6 +1893,47 @@ void VulkanGsRenderer::RecordShuffle() {
     });
 }
 
+void VulkanGsRenderer::RunEffect(const GsEffect& e) {
+    if (!effects_.ready()) return;
+    Flush();                                    // the draws before it, recorded
+    auto target = targets_.find(Key{e.fbp, e.fbw, e.psm});
+    if (target == targets_.end() || !target->second.image) return;
+    Image& t = target->second;
+    Image* d = nullptr;
+    if (e.depth) {
+        auto depth = depths_.find(Key{e.zbp, e.zwidth, e.zheight});
+        if (depth != depths_.end() && depth->second.depth_view) d = &depth->second;
+    }
+    GsEffects::Target view;
+    view.view = t.view;
+    view.pw = t.pw();
+    view.ph = t.ph();
+    view.scale = t.scale;
+    g_.Record([&](VkCommandBuffer cmd) {
+        drawn_ = DrawState{};
+        if (d) {
+            Transition(cmd, *d, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            view.depth_view = d->depth_view;
+            view.stencil_view = d->stencil_view;
+        }
+        if (t.layout == VK_IMAGE_LAYOUT_GENERAL) {
+            ++g_barriers;
+            VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                 &b, 0, nullptr, 0, nullptr);
+        }
+        Transition(cmd, t, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        effects_.Record(cmd, e, view);
+        MemoryBarrier(cmd);                     // (what it wrote, to the draws after: the scene's depth)
+        ++g_dispatches;
+        g_.Mark(cmd, kProfEffects);
+    });
+}
+
 void VulkanGsRenderer::TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm,
                                             std::uint32_t width, std::uint32_t height, std::uint32_t first_row,
                                             std::uint32_t rows, std::uint32_t first_col, std::uint32_t end_col) {
@@ -1817,9 +1988,22 @@ void VulkanGsRenderer::DepthFromMemory(std::uint32_t zbp, std::uint32_t width, s
     });
 }
 
+void VulkanGsRenderer::SetScaleRule(std::uint32_t fbp_begin, std::uint32_t fbp_end, std::uint32_t max_fbw) {
+    if (fbp_begin == rule_begin_ && fbp_end == rule_end_ && max_fbw == rule_max_fbw_) return;
+    DropImages();
+    rule_begin_ = fbp_begin;
+    rule_end_ = fbp_end;
+    rule_max_fbw_ = max_fbw;
+}
+
 void VulkanGsRenderer::SetScale(std::uint32_t scale) {
     scale = std::min(std::max(1u, scale), kMaxScale);
     if (scale == scale_) return;
+    DropImages();
+    scale_ = scale;
+}
+
+void VulkanGsRenderer::DropImages() {
     // Every target, depth buffer and feedback copy goes (the caller has had
     // what the GPU drew written to its local memory first); they come back
     // at the new size, from memory, as they are next asked for. The linear
@@ -1845,7 +2029,7 @@ void VulkanGsRenderer::SetScale(std::uint32_t scale) {
     targets_.clear();
     depths_.clear();
     feedbacks_.clear();
-    scale_ = scale;
+    effects_.Forget();
 }
 
 namespace {
@@ -2043,17 +2227,18 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     const VkSpecializationMapEntry feature_entry{0, 0, sizeof features};
     VkSpecializationInfo specialisation{1, &feature_entry, sizeof features, &features};
     stages[1].pSpecializationInfo = &specialisation;
-    VkVertexInputBindingDescription binding{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    const VkVertexInputBindingDescription bindings[2] = {{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX},
+                                                         {1, sizeof(VertexRange), VK_VERTEX_INPUT_RATE_VERTEX}};
     VkVertexInputAttributeDescription attributes[6] = {
         {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(PackedVertex, x)},
         {1, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(PackedVertex, r)},
         {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(PackedVertex, s)},
         {3, 0, VK_FORMAT_R32_UINT, offsetof(PackedVertex, z)},
         {4, 0, VK_FORMAT_R8_UNORM, offsetof(PackedVertex, fog)},
-        {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(PackedVertex, range)}};
+        {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 0}};
     VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    input.vertexBindingDescriptionCount = 1;
-    input.pVertexBindingDescriptions = &binding;
+    input.vertexBindingDescriptionCount = 2;
+    input.pVertexBindingDescriptions = bindings;
     input.vertexAttributeDescriptionCount = 6;
     input.pVertexAttributeDescriptions = attributes;
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -2082,9 +2267,12 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     depth.back = depth.front;
     VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
-                                       VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE};
+                                       VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+                                       VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, VK_DYNAMIC_STATE_STENCIL_OP,
+                                       VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                       VK_DYNAMIC_STATE_STENCIL_REFERENCE};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 6;
+    dynamic.dynamicStateCount = 11;
     dynamic.pDynamicStates = dynamic_states;
     const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -2596,7 +2784,7 @@ Image* VulkanGsRenderer::TargetFor(const GsDrawState& state) {
     MakeImage(t, state.width, state.height,
               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                   VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-              VK_FORMAT_R8G8B8A8_UNORM, ScaleOf(state.width));
+              VK_FORMAT_R8G8B8A8_UNORM, ScaleOf(state.width, state.fbp));
     // Local memory starts as zeros.
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -2615,7 +2803,7 @@ Image* VulkanGsRenderer::DepthFor(std::uint32_t key, std::uint32_t width, std::u
     MakeImage(d, width, height,
               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-              kDepthFormat, ScaleOf(width));
+              kDepthFormat, ScaleOf(width, key & 0xFFFFu));
     // Local memory starts as zeros: the farthest Z.
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -2779,8 +2967,8 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
                 SpriteSpan& o = sprites_[n];
                 auto widen = [&](int mine, int theirs, float value_mine, float value_theirs) {
                     range[mine] = value_mine;
-                    for (int k = 0; k < 6 && o.vertex + k < pending_.size(); ++k)
-                        pending_[o.vertex + k].range[theirs] = value_theirs;
+                    for (int k = 0; k < 6 && o.vertex + k < ranges_.size(); ++k)
+                        ranges_[o.vertex + k].range[theirs] = value_theirs;
                 };
                 if (same(o.y0, sp.y0) && same(o.y1, sp.y1) && same(o.t0, sp.t0) && same(o.t1, sp.t1)) {
                     if (same(o.x1, sp.x0) && same(o.s1, sp.s0))         // it, then this one to its right
@@ -2831,7 +3019,7 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             FlatQuadRange(q, state);
             for (int n = 0; n < 4; ++n) range[n] = q.range[n];
             for (int k = 0; k < 3; ++k)
-                for (int n = 0; n < 4; ++n) pending_[q.vertex[0] + k].range[n] = q.range[n];
+                for (int n = 0; n < 4 && q.vertex[0] + k < ranges_.size(); ++n) ranges_[q.vertex[0] + k].range[n] = q.range[n];
             quads_.push_back(q);
             last_flat_valid_ = false;
         } else {
@@ -2841,6 +3029,45 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             last_flat_.vertex = pending_.size();
             last_flat_valid_ = true;
         }
+    }
+    Append(state, v, count, range);
+}
+
+/* A run of primitives in one state (the bridge's fast path, handed over as
+   one): appended at once where none of what DrawTriangles does a primitive
+   at a time applies - a target sampled as it is drawn, a blend in the
+   shader, an alpha test in two passes, a sprite's or flat quad's range on a
+   target drawn larger. Else each as DrawTriangles. */
+void VulkanGsRenderer::DrawTriangleRun(const GsDrawState& state, const GsVertex* v, std::size_t per,
+                                       std::size_t prims) {
+    const bool feedback = state.textured && state.texture_target && state.tex_fbp == state.fbp &&
+                          state.tex_fbw == state.fbw;
+    const bool depth_written = state.depth && state.depth_write;
+    const bool two_pass = state.alpha_test && state.atst != 1 &&
+                          (((state.afail == 1 || state.afail == 2) && depth_written) || state.afail == 3);
+    if (per < 3 || per % 3 || feedback || ShaderBlend(state) || two_pass || state.sprite ||
+        (scale_ > 1 && state.textured && !state.texture_target)) {
+        for (std::size_t i = 0; i < prims; ++i) DrawTriangles(state, v + i * per, per);
+        return;
+    }
+    RecordShuffle();
+    if (!SameBatch(state, state_)) Flush();
+    state_ = state;
+    last_flat_valid_ = false;
+    Append(state, v, per * prims, kNoRange.range);
+}
+
+void VulkanGsRenderer::Append(const GsDrawState& state, const GsVertex* v, std::size_t count, const float* range) {
+    // The ranges kept in step with the vertices where this batch can read
+    // them (the earlier vertices' given none, should the batch start without).
+    VertexRange* range_out = nullptr;
+    if (RangesWanted(state) || !ranges_.empty()) {
+        const std::size_t behind = pending_.size() - ranges_.size();
+        VertexRange* fill = ranges_.Grow(behind + count / 3 * 3);
+        for (std::size_t i = 0; i < behind; ++i) fill[i] = kNoRange;
+        range_out = fill + behind;
+        for (std::size_t i = 0; i < count / 3 * 3; ++i)
+            for (int n = 0; n < 4; ++n) range_out[i].range[n] = range[n];
     }
     PackedVertex* out = pending_.Grow(count / 3 * 3);
     for (std::size_t i = 0; i + 2 < count; i += 3) {
@@ -2859,7 +3086,6 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             out->q = p.q;
             out->z = p.z;
             out->fog = p.fog;
-            for (int n = 0; n < 4; ++n) out->range[n] = range[n];
         }
     }
 }
@@ -2912,7 +3138,7 @@ void VulkanGsRenderer::FlatQuadRange(FlatQuad& q, const GsDrawState& state) {
         if (changed)
             for (int t = 0; t < 2; ++t)
                 for (int k = 0; k < 3; ++k)
-                    for (int c = 0; c < 4; ++c) pending_[o.vertex[t] + k].range[c] = o.range[c];
+                    for (int c = 0; c < 4 && o.vertex[t] + k < ranges_.size(); ++c) ranges_[o.vertex[t] + k].range[c] = o.range[c];
     }
     for (int axis = 0; axis < 2; ++axis) {
         q.range[axis] = open_lo[axis] ? q.lo[axis] : std::min(q.lo[axis] + in[axis], 0.5f * (q.lo[axis] + q.hi[axis]));
@@ -2937,10 +3163,37 @@ void VulkanGsRenderer::Flush() {
     void* vertex_data = Vertices(bytes, &vertex_buffer, &vertex_offset);
     if (!vertex_data) {
         pending_.clear();
+        ranges_.clear();
         return;
     }
     std::memcpy(vertex_data, pending_.data(), bytes);
     Image* t = TargetFor(state_);
+    // The ranges (gs.vert): read only on a target drawn larger (gs.frag's
+    // snap) - there the batch's own, or the one that keeps nothing in for
+    // all its vertices (stride 0). Elsewhere nothing reads them: the
+    // vertices' own buffer stands in (stride 0), bound with them once a
+    // chunk of the ring as before.
+    VkBuffer range_buffer = vertex_buffer;      // (stride 0: one for all)
+    VkDeviceSize range_offset = 0;
+    const bool ranges_read = state_.textured && t->scale > 1;
+    const bool own_ranges = ranges_read && !ranges_.empty() && ranges_.size() == pending_.size();
+    if (own_ranges) {
+        const VkDeviceSize range_bytes = ranges_.size() * sizeof(VertexRange);
+        void* range_data = Vertices(range_bytes, &range_buffer, &range_offset);
+        if (!range_data) {
+            pending_.clear();
+            ranges_.clear();
+            return;
+        }
+        std::memcpy(range_data, ranges_.data(), range_bytes);
+    } else if (ranges_read) {
+        if (!no_range_) {
+            void* mapped = nullptr;
+            if (Buffer(sizeof kNoRange, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &no_range_, &no_range_memory_, &mapped))
+                std::memcpy(mapped, &kNoRange, sizeof kNoRange);
+        }
+        range_buffer = no_range_;
+    }
     // A target's own depth buffer is keyed past any ZBP (which has 9 bits).
     // A depth buffer is kDepthRows tall whatever draws with it (a 16-bit
     // target is twice as tall: the same memory), so it is one image.
@@ -2959,8 +3212,13 @@ void VulkanGsRenderer::Flush() {
             }
         }
     }
-    // The shader addresses and filters texels itself (texelFetch), as the GS does.
-    const int sampler = 3;
+    // The shader addresses and filters texels itself (texelFetch), as the GS
+    // does - but a texture pack's replacement in REPEAT or CLAMP, which the
+    // GPU filters (ReplacementSampler), and MODERN filtering's levels (tag
+    // bit 1: gs.frag's Bilinear, linear within a level, its texelFetch the same).
+    const int sampler = (texture->replaced & 0x100u) && state_.wms < 2 && state_.wmt < 2
+                            ? ReplacementSampler(state_)
+                            : (state_.tag & 2u) ? 7 : 3;
     VkDescriptorSet set = SetFor(*texture, sampler);
     // Render to texture: the target itself, or a copy when it is also drawn into.
     Image* source = nullptr;
@@ -3064,6 +3322,12 @@ void VulkanGsRenderer::Flush() {
                        std::uint32_t(state_.d) << 6;
     if (state_.textured && t->scale > 1) params.blend_ops |= (t->scale & 0xFFu) << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
+    if (state_.tag & 1u) params.blend_ops |= 1u << 19;          // gs.frag: the paint's Fresnel term
+    if (state_.tag & 2u) params.blend_ops |= 1u << 20;          // gs.frag: modern texture filtering
+    params.blend_ops |= ((state_.tag >> 8) & 7u) << 22 |       // ...its taps, and the player's filter
+                        ((state_.tag >> 11) & 3u) << 25;
+    if ((state_.tag & 4u) && !ShaderBlend(state_) && SceneDepthSet())
+        params.blend_ops |= 1u << 21;                           // gs.frag: a soft particle
     params.blend_ops |= std::uint32_t(Blender16(state_)) << 17;     // gs.frag: S for the blender
     const std::uint32_t count = std::uint32_t(pending_.size());
     static int complaints = 0;
@@ -3145,19 +3409,50 @@ void VulkanGsRenderer::Flush() {
                                                     VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
             if (drawn_.recording != g_.recording_id()) drawn_ = DrawState{g_.recording_id()};
             DrawState& d = drawn_;
-            const int depth_test = state_.depth ? 1 : 0, stencil_test = state_.date ? 1 : 0;
+            // The stencil: the destination alpha test (bit 1, the setup
+            // pass's), else - once a game tags paint to be marked (tag bit 3,
+            // its effects' screen-space reflections) - bit 2 set where the
+            // paint is drawn and cleared where anything else is, so it holds
+            // the paint left on top.
+            if (state_.tag & 8u) paint_mask_ = true;
+            const int stencil_test = state_.date ? 1 : paint_mask_ ? ((state_.tag & 1u) ? 2 : 3) : 0;
+            const int depth_test = state_.depth ? 1 : 0;
             const int compare = int(state_.ztst & 3);
             if (d.depth_test != depth_test) vkCmdSetDepthTestEnable(cmd, VkBool32(d.depth_test = depth_test));
-            if (d.stencil_test != stencil_test) vkCmdSetStencilTestEnable(cmd, VkBool32(d.stencil_test = stencil_test));
+            if (d.stencil_test != stencil_test) {
+                d.stencil_test = stencil_test;
+                vkCmdSetStencilTestEnable(cmd, VkBool32(stencil_test != 0));
+                const VkStencilFaceFlags both = VK_STENCIL_FACE_FRONT_AND_BACK;
+                if (stencil_test == 1) {
+                    vkCmdSetStencilOp(cmd, both, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP,
+                                      VK_COMPARE_OP_EQUAL);
+                    vkCmdSetStencilCompareMask(cmd, both, 1);
+                    vkCmdSetStencilWriteMask(cmd, both, 0);
+                    vkCmdSetStencilReference(cmd, both, 1);
+                } else {
+                    // (off too: a pipeline's dynamic state is set before it draws)
+                    vkCmdSetStencilOp(cmd, both, VK_STENCIL_OP_KEEP,
+                                      stencil_test >= 2 ? VK_STENCIL_OP_REPLACE : VK_STENCIL_OP_KEEP,
+                                      VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
+                    vkCmdSetStencilCompareMask(cmd, both, 0);
+                    vkCmdSetStencilWriteMask(cmd, both, stencil_test >= 2 ? 2 : 0);
+                    vkCmdSetStencilReference(cmd, both, stencil_test == 2 ? 2 : 0);
+                }
+            }
             if (d.compare != compare) vkCmdSetDepthCompareOp(cmd, kCompare[d.compare = compare]);
             if (d.sets[0] != set || d.sets[1] != clut_set_) {
                 d.sets[0] = set;
                 d.sets[1] = clut_set_;
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, d.sets, 0, nullptr);
             }
-            if (destination_set)
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 2, 1, &destination_set, 0,
-                                        nullptr);
+            // Set 2: the copy blending in the shader reads, the scene's depth
+            // for a soft particle, or the blank texture (bound all the same).
+            VkDescriptorSet set2 = destination_set;
+            if (!set2) set2 = (state_.tag & 4u) && SceneDepthSet() ? SceneDepthSet() : SampledSet(blank_.image);
+            if (set2 && d.set2 != set2) {
+                d.set2 = set2;
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 2, 1, &set2, 0, nullptr);
+            }
             const VkViewport vp{0, 0, float(t->pw()), float(t->ph()), 0, 1};
             if (std::memcmp(&vp, &d.viewport, sizeof vp) != 0) {
                 d.viewport = vp;
@@ -3179,13 +3474,27 @@ void VulkanGsRenderer::Flush() {
                 d.size[1] = size[1];
                 vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, size);
             }
-            // The ring's chunk bound once, at its start; the batch by its first vertex.
-            if (d.vertices != vertex_buffer) {
-                d.vertices = vertex_buffer;
-                const VkDeviceSize zero = 0;
-                vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer, &zero);
+            // Without ranges read: the ring's chunk bound once, at its start,
+            // the batch by its first vertex. With them: the batch's vertices
+            // and ranges each where they are (the ranges' stride dynamic).
+            std::uint32_t first = 0;
+            if (!own_ranges) {
+                if (d.vertices != vertex_buffer || d.ranges != range_buffer) {
+                    d.vertices = vertex_buffer;
+                    d.ranges = range_buffer;
+                    const VkBuffer buffers[2] = {vertex_buffer, range_buffer};
+                    const VkDeviceSize offsets[2] = {0, 0};
+                    const VkDeviceSize strides[2] = {sizeof(PackedVertex), 0};
+                    vkCmdBindVertexBuffers2(cmd, 0, 2, buffers, offsets, nullptr, strides);
+                }
+                first = std::uint32_t(vertex_offset / sizeof(PackedVertex));
+            } else {
+                d.vertices = d.ranges = VK_NULL_HANDLE;
+                const VkBuffer buffers[2] = {vertex_buffer, range_buffer};
+                const VkDeviceSize offsets[2] = {vertex_offset, range_offset};
+                const VkDeviceSize strides[2] = {sizeof(PackedVertex), sizeof(VertexRange)};
+                vkCmdBindVertexBuffers2(cmd, 0, 2, buffers, offsets, nullptr, strides);
             }
-            const std::uint32_t first = std::uint32_t(vertex_offset / sizeof(PackedVertex));
             // PABE splits each pass again: blended where As >= 0x80 (the shader's
             // pabe 1), not blended below (pabe 2, the pipeline without blending).
             const bool split = state_.blend && state_.pabe;
@@ -3234,6 +3543,7 @@ void VulkanGsRenderer::Flush() {
         });
     }
     pending_.clear();
+    ranges_.clear();
 }
 
 bool VulkanGsRenderer::ReadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height,
@@ -3435,7 +3745,8 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (decode_pipeline_) vkDestroyPipeline(g_.device, decode_pipeline_, nullptr);
     if (decode_) vkDestroyShaderModule(g_.device, decode_, nullptr);
     for (auto [buffer, memory] : {std::pair{gsmem_, gsmem_memory_}, std::pair{linear_, linear_memory_},
-                                  std::pair{clut_, clut_memory_}, std::pair{tables_, tables_memory_}}) {
+                                  std::pair{clut_, clut_memory_}, std::pair{tables_, tables_memory_},
+                                  std::pair{no_range_, no_range_memory_}}) {
         if (buffer) vkDestroyBuffer(g_.device, buffer, nullptr);
         if (memory) vkFreeMemory(g_.device, memory, nullptr);
     }
@@ -3448,7 +3759,7 @@ std::uint64_t GpuBusyNanoseconds() { return g_gpu_ns.load(); }
 std::string GpuProfileReport() {
     static const char* const kNames[kProfKinds] = {"other", "draws", "swizzle", "image<->linear", "memory copies",
                                                    "feedback copies", "decodes", "uploads", "clears", "DATE",
-                                                   "read-backs"};
+                                                   "read-backs", "effects"};
     std::uint64_t total = 0, ns[kProfKinds];
     for (int i = 0; i < kProfKinds; ++i) total += ns[i] = g_profile_ns[i].exchange(0);
     if (!total) return "";

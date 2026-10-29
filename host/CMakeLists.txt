@@ -42,11 +42,16 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/spu2.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/audio.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/music.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/presence.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/timers.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/pc_menu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/window.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/settings.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/hud.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/libnet.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/logitech.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/bindings.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/timeline.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gs.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gs_thread.cpp
@@ -181,7 +186,7 @@ set(PS2HOST_VURECOMP ${CMAKE_CURRENT_LIST_DIR}/../tools/vurecomp.py)
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp
     COMMAND ${Python3_EXECUTABLE} ${PS2HOST_VURECOMP} --corpus --count 120 --seed 1
             --out ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp
-    DEPENDS ${PS2HOST_VURECOMP} ${CMAKE_CURRENT_LIST_DIR}/../tools/vunative.py
+    DEPENDS ${PS2HOST_VURECOMP}
     COMMENT "vurecomp: the VU test corpus")
 add_executable(ps2host_tests ${CMAKE_CURRENT_LIST_DIR}/tests/host_tests.cpp
                              ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp)

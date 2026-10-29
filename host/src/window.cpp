@@ -12,9 +12,12 @@
 #define NOMINMAX
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <functional>
@@ -194,6 +197,102 @@ std::string& GameTitleText() {
 void SetGameTitle(const std::string& title) { GameTitleText() = title; }
 const std::string& GameTitle() { return GameTitleText(); }
 
+/* PS2HOST_REFRESH_LOG=1: every 600 pictures shown, the screen's refreshes
+   they went to (each the first of its blanks after the picture was handed
+   over, RefreshTiming's): pictures handed over in a refresh that already had
+   one (a picture dropped, or shown a refresh late), refreshes none was handed
+   over in (the one before shown twice - at the screen's own rate, a
+   stutter), and the nearest a picture came to a blank (near one, a wake-up's
+   error decides which refresh it goes to). */
+void NoteRefreshes(std::uint64_t shown_ns) {
+    static const bool on = std::getenv("PS2HOST_REFRESH_LOG") != nullptr;
+    if (!on) return;
+    double period = 0;
+    u64 anchor = 0;
+    if (!WindowRefreshTiming(&period, &anchor)) return;
+    static double last_blank = 0;               // the blank the last picture went to
+    static unsigned shown = 0, doubled = 0, missed = 0;
+    static double nearest = 1e18;
+    const double since = double(shown_ns) - double(anchor);
+    const double into = since - std::floor(since / period) * period;
+    const double blank = double(shown_ns) + (period - into);
+    nearest = std::min(nearest, std::min(into, period - into));
+    if (last_blank > 0) {
+        const long long apart = std::llround((blank - last_blank) / period);
+        if (apart <= 0) ++doubled;
+        else missed += unsigned(apart - 1);
+    }
+    last_blank = blank;
+    if (++shown < 600) return;
+    double locked_period = 0;
+    u64 locked_anchor = 0;
+    std::fprintf(stderr,
+                 "[refresh] 600 pictures on a %.4f ms refresh: %u to a refresh that had one, %u refreshes without "
+                 "one; nearest a blank %.2f ms; blanks %s\n",
+                 period / 1e6, doubled, missed, nearest / 1e6,
+                 RefreshLocked(&locked_period, &locked_anchor) ? "locked to the screen's" : "by the processor's clock");
+    shown = doubled = missed = 0;
+    nearest = 1e18;
+}
+
+/* Each picture's GPU work done (Display::SetGpuDoneObserver), `tag` its
+   blank: the lead the locked blanks keep (SetRefreshLead) - the longest
+   blank-to-done of the last two seconds, a millisecond and a tenth more,
+   as the screen's refreshes go (a 9 ms picture at 144: 3 ms - done before
+   the second refresh after its blank, never on one). Every picture then
+   waits that long, the longest's time and the margin: taken only where that
+   is a millisecond under what they wait with the blanks on the screen's
+   (each to the refresh after it is done) - a 60 Hz screen's pictures done
+   3 ms after their blank: 6 ms against 16.7. At 144 a 3x picture's 5.5 ms,
+   now and then 8.5, is quicker on the refresh after: none. Not with frame pacing
+   (FrameDue times its pictures: a lead would only move them); nor with
+   PS2HOST_REFRESH_LEAD=0. With
+   PS2HOST_REFRESH_LOG, each 600 pictures: blank to shown (the screen's next
+   refresh after done), what a press waits for beyond the game. */
+void NoteGpuDone(std::uint64_t tag, std::uint64_t done_ns) {
+    if (done_ns <= tag) return;
+    double period = 0;
+    u64 anchor = 0;
+    if (!WindowRefreshTiming(&period, &anchor) || !(period > 0)) return;
+    const u64 lag = done_ns - tag;
+    struct Seen { u64 at, lag; };
+    static std::vector<Seen> seen;              // the last two seconds'
+    seen.push_back({done_ns, lag});
+    std::size_t old = 0;
+    while (old < seen.size() && seen[old].at + 2'000'000'000ull < done_ns) ++old;
+    seen.erase(seen.begin(), seen.begin() + std::ptrdiff_t(old));
+    u64 most = 0;
+    double unled = 0;                           // waited on average with the blanks on the screen's
+    for (const Seen& s : seen) {
+        most = std::max(most, s.lag);
+        unled += std::ceil(double(s.lag) / period) * period;
+    }
+    unled /= double(seen.size());
+    const double led = double(most) * 1.1 + 1e6;   // waited by every picture with the lead
+    static bool leading = false;
+    leading = leading ? led < unled : led < unled - 1e6;
+    const double lead = leading ? std::fmod(led, period) : 0.0;
+    static const char* forced = std::getenv("PS2HOST_REFRESH_LEAD");     // (=0: none, to compare)
+    const bool wanted = !(forced && forced[0] == '0') && !SettingOn("frame_pacing", FramePacingDefault());
+    SetRefreshLead(wanted ? u64(lead) : 0);
+    static const bool log = std::getenv("PS2HOST_REFRESH_LOG") != nullptr;
+    if (!log) return;
+    const double since = double(done_ns) - double(anchor);
+    const double shown = double(done_ns) + (period - (since - std::floor(since / period) * period));
+    static double sum = 0, longest = 0, lag_sum = 0;
+    static unsigned n = 0;
+    sum += shown - double(tag);
+    longest = std::max(longest, shown - double(tag));
+    lag_sum += double(lag);
+    if (++n < 600) return;
+    std::fprintf(stderr,
+                 "[latency] 600 pictures: blank to shown %.2f ms (longest %.2f), blank to done on the GPU %.2f ms; "
+                 "the blanks' lead %.2f ms\n",
+                 sum / n / 1e6, longest / 1e6, lag_sum / n / 1e6, lead / 1e6);
+    sum = longest = lag_sum = 0;
+    n = 0;
+}
+
 bool OpenWindow(const wchar_t* title, int width, int height) {
 #ifdef PS2HOST_VULKAN
     std::string narrow;
@@ -204,7 +303,9 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
     g_display = ps2gpu::CreateVulkanDisplay(narrow.c_str(), width, height, &error);
     if (g_display) {
         Note("window", "window: Vulkan on " + g_display->Describe());
-        g_display->SetKeepRefresh(Setting("frame_rate", "60") == "display");
+        g_display->SetVrr(SettingOn("vrr"));
+        g_display->SetGpuBoost(SettingOn("gpu_boost", true));      // (the GPU's clocks kept up)
+        g_display->SetKeepRefresh(Setting("frame_rate", "60") == "display" || SettingOn("vrr"));
         if (SettingOn("fullscreen")) g_display->SetFullscreen(true);
         ApplyCursorArt();
         g_display->SetPresentObserver([](std::uint64_t due_ns, std::uint64_t shown_ns, bool dropped) {
@@ -228,6 +329,8 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
                 last_shown = shown_ns;
             }
         });
+        if (std::getenv("PS2HOST_REFRESH_LOG")) g_display->SetShownObserver(NoteRefreshes);
+        g_display->SetGpuDoneObserver(NoteGpuDone);
         if (SettingOn("vsync")) g_display->SetVsync(true);
         g_display->SetAspect(SettingAspect());
         g_display->SetAntiAliasing(DisplayAntiAliasing(Setting("antialiasing", "off")));
@@ -252,13 +355,22 @@ bool WindowFocused() {
     return g_window && GetForegroundWindow() == g_window;
 }
 
+bool WindowMinimized() {
+#ifdef PS2HOST_VULKAN
+    if (g_display) return g_display->Minimized();
+#endif
+    return g_window && IsIconic(g_window);
+}
+
 bool WindowClosed() { return g_closed; }
 
 // A game's own EXIT GAME: as if the window had been closed.
 void QuitGame() { g_closed = true; }
 
 bool HostKeyDown(int key) {
-    if (ScriptedKeyDown(key)) return true;          // --key
+    // --key: a run with scripted keys sees those alone - not whatever the
+    // person at the PC types meanwhile (read with the window behind).
+    if (KeysScripted()) return ScriptedKeyDown(key);
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->KeyDown(Scancode(key));
 #endif
@@ -274,6 +386,7 @@ void HostTriggerEffects(const HostTriggerEffect& left, const HostTriggerEffect& 
             t.start = e.start;
             t.force = e.force;
             t.frequency = e.frequency;
+            for (int i = 0; i < 10; ++i) t.zones[i] = e.zones[i];
             return t;
         };
         g_display->SetTriggerEffects(effect(left), effect(right));
@@ -642,9 +755,38 @@ bool WindowFullscreen() {
 
 void SetWindowKeepRefresh(bool keep) {
 #ifdef PS2HOST_VULKAN
-    if (g_display) g_display->SetKeepRefresh(keep);
+    // (On a VRR screen, always: its own refresh is the most it can follow.)
+    if (g_display) g_display->SetKeepRefresh(keep || SettingOn("vrr"));
 #endif
     (void)keep;
+}
+
+void SetWindowVrr(bool on) {
+    SetSettingOn("vrr", on);
+#ifdef PS2HOST_VULKAN
+    if (g_display) {
+        g_display->SetVrr(on);
+        g_display->SetKeepRefresh(on || Setting("frame_rate", "60") == "display");
+    }
+#endif
+}
+
+bool WindowVrr() { return SettingOn("vrr"); }
+
+void SetWindowGpuBoost(bool on) {
+    SetSettingOn("gpu_boost", on);
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetGpuBoost(on);
+#endif
+}
+
+bool WindowGpuBoost() { return SettingOn("gpu_boost", true); }
+
+bool WindowGpuBoosted() {
+#ifdef PS2HOST_VULKAN
+    if (g_display) return g_display->GpuBoosted();
+#endif
+    return false;
 }
 
 std::uint64_t LatePictures() { return g_late_pictures.load(std::memory_order_relaxed); }
@@ -654,6 +796,18 @@ float WindowRefreshRate() {
     if (g_display) return g_display->RefreshRate();
 #endif
     return 0.0f;
+}
+
+bool WindowRefreshTiming(double* period_ns, u64* blank_ns) {
+#ifdef PS2HOST_VULKAN
+    std::uint64_t blank = 0;
+    if (g_display && g_display->RefreshTiming(period_ns, &blank)) {
+        *blank_ns = blank;
+        return true;
+    }
+#endif
+    (void)period_ns, (void)blank_ns;
+    return false;
 }
 
 ps2gpu::Display* WindowDisplay() {

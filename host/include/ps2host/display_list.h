@@ -49,6 +49,12 @@ struct ListBlendOptions {
     // turned or moved by more than `jump` of its own length the cut (not its
     // lights' rows: a shot's flash). The rest of it blended whole.
     unsigned view_first = 0, view_end = ~0u;
+    // A cut the view's rows miss: most of the things new (`new_share` of the
+    // segments: another room's or shot's) while the camera's view moved by
+    // `new_view` of a cut or more. Outbreak (played 2026-10-24): two steps
+    // in 22 minutes, a picture between two shots each; a still camera over
+    // a room whose things come and go (a fire's) is no cut.
+    float new_share = 0.5f, new_view = 0.3f;
 };
 
 struct ListBlend {
@@ -60,11 +66,21 @@ struct ListBlend {
     u32 jumps = 0;          // matched but jumping: not blended
     bool cut = false;       // the camera cut: nothing blended
     bool whole = false;     // the lists' codes the same to their end
+    // How near the blend came to its limits (a trace's, to find the moves
+    // that look wrong): the largest move of a blended value, as a share of
+    // the jump that would have stepped its segment (1: it would have), and
+    // whose segment; segments blended with a move above half of it; the
+    // camera's view's largest row move as a share of the cut's (1: a cut).
+    float worst = 0.0f;
+    u32 worst_segment = 0;
+    u32 near = 0;
+    float view = 0.0f;
 };
 
 struct ListBlendPlan {
     std::vector<u32> at;    // the newer list's words to blend
     std::vector<float> from, to;
+    std::vector<u32> segment;   // each word's segment (the newer list's), in order
     ListBlend stats;
 };
 

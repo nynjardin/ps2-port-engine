@@ -20,6 +20,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -119,9 +120,35 @@ Outcome DeleteThread(Vm& vm, Context& c) {
     return Ret(c, KE_OK);
 }
 
+/* A thread taken out of the queue of the semaphore or message box it waits
+   on (it is terminated): left there, the next SignalSema handed its release
+   to the dead thread and the waiter after it waited for ever - RenderWare
+   Audio terminates a stream's thread waiting on the stream's lock as the
+   stream stops (Burnout 3: its music stopped for good, and a screen waiting
+   on a stream with it). */
+void LeaveWaitQueue(Vm& vm, const Thread& t) {
+    if (t.ready) return;
+    if (t.wait == Wait::Sema) {
+        auto found = vm.semaphores.find(t.object);
+        if (found != vm.semaphores.end()) {
+            auto& waiting = found->second.waiting;
+            waiting.erase(std::remove(waiting.begin(), waiting.end(), t.id), waiting.end());
+        }
+    } else if (t.wait == Wait::Mbx) {
+        auto found = vm.mailboxes.find(t.object);
+        if (found != vm.mailboxes.end()) {
+            auto& waiting = found->second.waiting;
+            waiting.erase(std::remove_if(waiting.begin(), waiting.end(),
+                                         [&](const std::pair<u32, u32>& w) { return w.first == t.id; }),
+                          waiting.end());
+        }
+    }
+}
+
 Outcome TerminateThread(Vm& vm, Context& c) {
     auto found = vm.threads.find(A(vm, c, 0));
     if (found == vm.threads.end()) return Ret(c, u32(KE_UNKNOWN_THID));
+    LeaveWaitQueue(vm, found->second);
     found->second.ready = false;
     found->second.wait = Wait::Dormant;
     return Ret(c, KE_OK);
@@ -319,16 +346,19 @@ Outcome SendMbx(Vm& vm, Context& c) {
     if (found == vm.mailboxes.end()) return Ret(c, u32(KE_UNKNOWN_MBXID));
     MessageBox& box = found->second;
     const u32 message = A(vm, c, 1);
-    if (!box.waiting.empty()) {
+    // The first queued that still waits here (as SignalSema: LeaveWaitQueue).
+    bool given = false;
+    while (!given && !box.waiting.empty()) {
         const std::pair<u32, u32> waiter = box.waiting.front();
         box.waiting.pop_front();
-        Thread& t = vm.threads[waiter.first];
+        auto t = vm.threads.find(waiter.first);
+        if (t == vm.threads.end() || t->second.ready || t->second.wait != Wait::Mbx) continue;
         vm.Write(waiter.second, message, 4);
-        t.c.r[2] = KE_OK;
-        vm.MakeReady(t);
-    } else {
-        box.messages.push_back(message);
+        t->second.c.r[2] = KE_OK;
+        vm.MakeReady(t->second);
+        given = true;
     }
+    if (!given) box.messages.push_back(message);
     Return(c, KE_OK);
     return vm.reschedule && !vm.in_interrupt ? Outcome::Yield : Outcome::Return;
 }
@@ -456,14 +486,21 @@ Outcome SignalSema(Vm& vm, Context& c) {
     auto found = vm.semaphores.find(A(vm, c, 0));
     if (found == vm.semaphores.end()) return Ret(c, u32(KE_UNKNOWN_SEMID));
     Semaphore& s = found->second;
-    if (!s.waiting.empty()) {
-        Thread& t = vm.threads[s.waiting.front()];
+    // The first queued that still waits here (one no longer - terminated,
+    // deleted - is dropped, not given the count: LeaveWaitQueue).
+    bool woke = false;
+    while (!woke && !s.waiting.empty()) {
+        const u32 id = s.waiting.front();
         s.waiting.pop_front();
-        t.c.r[2] = KE_OK;
-        vm.MakeReady(t);
-    } else if (s.count < s.max || s.max <= 0) {
-        ++s.count;
+        auto waiter = vm.threads.find(id);
+        if (waiter == vm.threads.end() || waiter->second.ready || waiter->second.wait != Wait::Sema ||
+            waiter->second.object != found->first)
+            continue;
+        waiter->second.c.r[2] = KE_OK;
+        vm.MakeReady(waiter->second);
+        woke = true;
     }
+    if (!woke && (s.count < s.max || s.max <= 0)) ++s.count;
     Return(c, KE_OK);
     return vm.reschedule && !vm.in_interrupt ? Outcome::Yield : Outcome::Return;
 }
@@ -742,8 +779,34 @@ Outcome Puts(Vm& vm, Context& c) {
 
 // ---------------------------------------------------------------- interrupts
 
+/* A thread's interrupts off until it turns them on again: no interrupt and
+   no other thread between (Execute runs its quantum on). Left out, a
+   quantum's end split RenderWare Audio's critical sections - a stream's
+   flags read, an interrupt's changed, the old ones written back - and its
+   stream threads waited for a wake-up that had come and gone (Burnout 3:
+   the music stopped mid race and a later load waited for it). The state
+   given back is 1 if they were on, 0 if already off, so nested pairs keep
+   them off until the outer one ends. An interrupt handler's are off anyway. */
 Outcome CpuSuspendIntr(Vm& vm, Context& c) {
-    if (const u32 state = A(vm, c, 0)) vm.Write(state, 0, 4);
+    Thread* t = vm.in_interrupt ? nullptr : vm.Current();
+    const bool were_on = t && !t->interrupts_off;
+    if (t) t->interrupts_off = true;
+    if (const u32 state = A(vm, c, 0)) vm.Write(state, were_on ? 1u : 0u, 4);
+    return Ret(c, KE_OK);
+}
+
+Outcome CpuResumeIntr(Vm& vm, Context& c) {
+    if (Thread* t = vm.in_interrupt ? nullptr : vm.Current()) t->interrupts_off = A(vm, c, 0) == 0;
+    return Ret(c, KE_OK);
+}
+
+Outcome CpuDisableIntr(Vm& vm, Context& c) {
+    if (Thread* t = vm.in_interrupt ? nullptr : vm.Current()) t->interrupts_off = true;
+    return Ret(c, KE_OK);
+}
+
+Outcome CpuEnableIntr(Vm& vm, Context& c) {
+    if (Thread* t = vm.in_interrupt ? nullptr : vm.Current()) t->interrupts_off = false;
     return Ret(c, KE_OK);
 }
 
@@ -946,9 +1009,45 @@ Outcome SdSetParam(Vm&, Context& c) { S().spu.SetParam(c.r[4] & 0xFFFF, c.r[5] &
 Outcome SdGetParam(Vm&, Context& c) { return Ret(c, S().spu.GetParam(c.r[4] & 0xFFFF)); }
 Outcome SdSetSwitch(Vm&, Context& c) { S().spu.SetSwitch(c.r[4] & 0xFFFF, c.r[5]); return Ret(c, 0); }
 Outcome SdGetSwitch(Vm&, Context& c) { return Ret(c, S().spu.GetSwitch(c.r[4] & 0xFFFF)); }
-Outcome SdSetAddr(Vm&, Context& c) { S().spu.SetAddr(c.r[4] & 0xFFFF, c.r[5]); return Ret(c, 0); }
+// The SPU2's interrupt traffic (SoundIrqTrace): the last 1,024 events, the
+// same one again counted rather than kept.
+struct IrqEvent {
+    u64 us = 0, last_us = 0, repeats = 0;
+    char kind = 0;              // A IRQA set, E interrupts on/off, F fired
+    u32 core = 0, value = 0, by = 0;
+};
+std::array<IrqEvent, 1024> g_irq_events;
+std::size_t g_irq_next = 0;
+
+void NoteIrq(u64 us, char kind, u32 core, u32 value, u32 by) {
+    if (g_irq_next) {
+        IrqEvent& last = g_irq_events[(g_irq_next - 1) % g_irq_events.size()];
+        if (last.kind == kind && last.core == core && last.value == value && last.by == by) {
+            ++last.repeats;
+            last.last_us = us;
+            return;
+        }
+    }
+    g_irq_events[g_irq_next++ % g_irq_events.size()] = IrqEvent{us, 0, 0, kind, core, value, by};
+}
+
+// An address or core attribute set: IRQA or the interrupt's enable noted.
+void NoteSet(u64 us, bool addr, u32 entry, u32 value, u32 by) {
+    if (addr && (entry >> 8) == 0x1F) NoteIrq(us, 'A', entry & 1, value, by);
+    if (!addr && (entry & ~1u) == 0x4) NoteIrq(us, 'E', entry & 1, value, by);
+}
+
+Outcome SdSetAddr(Vm& vm, Context& c) {
+    NoteSet(vm.NowUs(), true, c.r[4] & 0xFFFF, u32(c.r[5]), u32(c.r[31]));
+    S().spu.SetAddr(c.r[4] & 0xFFFF, c.r[5]);
+    return Ret(c, 0);
+}
 Outcome SdGetAddr(Vm&, Context& c) { return Ret(c, S().spu.GetAddr(c.r[4] & 0xFFFF)); }
-Outcome SdSetCoreAttr(Vm&, Context& c) { S().spu.SetCoreAttr(c.r[4] & 0xFFFF, c.r[5] & 0xFFFF); return Ret(c, 0); }
+Outcome SdSetCoreAttr(Vm& vm, Context& c) {
+    NoteSet(vm.NowUs(), false, c.r[4] & 0xFFFF, u32(c.r[5] & 0xFFFF), u32(c.r[31]));
+    S().spu.SetCoreAttr(c.r[4] & 0xFFFF, c.r[5] & 0xFFFF);
+    return Ret(c, 0);
+}
 Outcome SdGetCoreAttr(Vm&, Context& c) { return Ret(c, S().spu.GetCoreAttr(c.r[4] & 0xFFFF)); }
 
 // Pitch: 0x1000 plays a sample at its recorded rate; a semitone is 2^(1/12).
@@ -968,8 +1067,12 @@ Outcome SdPitch2Note(Vm&, Context& c) {
     return Ret(c, u32((note << 8) | (fine & 0xFF)));
 }
 
+u64 g_batch_us = 0;
+u32 g_batch_by = 0;
+
 u32 Batch(u32 func, u32 entry, u32 value) {
     Spu2& s = S().spu;
+    if (func == 0x03 || func == 0x04) NoteSet(g_batch_us, func == 0x03, entry, func == 0x04 ? value & 0xFFFF : value, g_batch_by);
     switch (func) {
         case 0x01: s.SetParam(entry, value & 0xFFFF); return 0;
         case 0x02: s.SetSwitch(entry, value); return 0;
@@ -985,6 +1088,8 @@ u32 Batch(u32 func, u32 entry, u32 value) {
 
 Outcome SdProcBatch(Vm& vm, Context& c) {
     const u32 batch = A(vm, c, 0), rets = A(vm, c, 1), count = A(vm, c, 2);
+    g_batch_us = vm.NowUs();
+    g_batch_by = u32(c.r[31]);
     for (u32 i = 0; i < count; ++i) {
         const u32 head = vm.Read(batch + 8 * i, 4), value = vm.Read(batch + 8 * i + 4, 4);
         const u32 result = Batch(head & 0xFFFF, head >> 16, value);
@@ -995,6 +1100,8 @@ Outcome SdProcBatch(Vm& vm, Context& c) {
 
 Outcome SdProcBatchEx(Vm& vm, Context& c) {
     const u32 batch = A(vm, c, 0), rets = A(vm, c, 1), count = A(vm, c, 2), voices = A(vm, c, 3);
+    g_batch_us = vm.NowUs();
+    g_batch_by = u32(c.r[31]);
     u32 done = 0;
     for (u32 i = 0; i < count; ++i) {
         const u32 head = vm.Read(batch + 8 * i, 4), value = vm.Read(batch + 8 * i + 4, 4);
@@ -1139,8 +1246,8 @@ const Map& Table() {
         {{"sysclib", 32}, Strrchr}, {{"sysclib", 34}, Strstr}, {{"sysclib", 36}, Strtol},
         {{"sysclib", 38}, Strtoul}, {{"sysclib", 42}, Vsprintf},
         {{"intrman", 4}, Succeed}, {{"intrman", 5}, Succeed}, {{"intrman", 6}, Succeed},
-        {{"intrman", 7}, Succeed}, {{"intrman", 8}, Succeed}, {{"intrman", 9}, Succeed},
-        {{"intrman", 17}, CpuSuspendIntr}, {{"intrman", 18}, Succeed},
+        {{"intrman", 7}, Succeed}, {{"intrman", 8}, CpuDisableIntr}, {{"intrman", 9}, CpuEnableIntr},
+        {{"intrman", 17}, CpuSuspendIntr}, {{"intrman", 18}, CpuResumeIntr},
         {{"intrman", 23}, QueryIntrContext},
         {{"thbase", 4}, CreateThread}, {{"thbase", 5}, DeleteThread},
         {{"thbase", 6}, StartThread}, {{"thbase", 7}, StartThreadArgs},
@@ -1286,6 +1393,7 @@ bool SoundInterrupts(Vm& vm, bool idle) {
     // The SPU2's own interrupt: playback (or a transfer) reached IRQA.
     Timed timed(Section::Spu2);
     s.spu.Advance(to, [&](u32 core) {
+        NoteIrq(vm.NowUs(), 'F', core, s.spu.GetAddr((0x1Fu << 8) | core), s.spu2.function ? s.spu2.function : s.irq_callback);
         if (s.spu2.function) vm.Call(s.spu2.function, {1u << core, s.spu2.arg});
         else if (s.irq_callback) vm.Call(s.irq_callback, {0});
     }, [&](u32 core) {
@@ -1334,6 +1442,25 @@ std::string Format(Vm& vm, u32 format, const std::function<u32()>& next) {
             default: std::snprintf(buffer, sizeof buffer, "%%%c", conversion); break;
         }
         out += buffer;
+    }
+    return out;
+}
+
+std::string SoundIrqTrace() {
+    std::string out = "  the SPU2's interrupts (us; A IRQA set, E on/off, F fired - by the caller, or the handler):\n";
+    char line[160];
+    for (std::size_t k = 0; k < g_irq_events.size(); ++k) {
+        const IrqEvent& e = g_irq_events[(g_irq_next + k) % g_irq_events.size()];
+        if (!e.kind) continue;
+        std::snprintf(line, sizeof line, "  %12llu %c core %u 0x%05X by 0x%08X", static_cast<unsigned long long>(e.us),
+                      e.kind, unsigned(e.core), unsigned(e.value), unsigned(e.by));
+        out += line;
+        if (e.repeats) {
+            std::snprintf(line, sizeof line, "  (and %llu times more, to %llu)", static_cast<unsigned long long>(e.repeats),
+                          static_cast<unsigned long long>(e.last_us));
+            out += line;
+        }
+        out += "\n";
     }
     return out;
 }

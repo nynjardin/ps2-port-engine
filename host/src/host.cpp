@@ -48,6 +48,14 @@ namespace ps2host {
    written, timed - the GS thread's work for a capture's frames (the GS model,
    the GPU bridge, the renderer's recording), the same every run; with
    PS2HOST_REPLAY_SAMPLE=1 sampled too (the sampler's report after). */
+/* The calling thread's CPU time (user and kernel), in milliseconds. */
+double ThreadCpuMs() {
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
+    auto ms = [](const FILETIME& t) { return double(u64(t.dwHighDateTime) << 32 | t.dwLowDateTime) / 10000.0; };
+    return ms(kernel) + ms(user);
+}
+
 int GsReplay(const std::string& file, const std::string& out) {
     std::FILE* f = std::fopen(file.c_str(), "rb");
     if (!f) {
@@ -70,6 +78,11 @@ int GsReplay(const std::string& file, const std::string& out) {
     gs::Gs& g = gs::TheGs();
     std::memcpy(g.memory.data(), data.data() + 5, kMemory);
     const bool gpu = std::getenv("PS2HOST_REPLAY_GPU") != nullptr;
+    // PS2HOST_REPLAY_SAMPLE=renderer: the renderer's own thread sampled
+    // instead (its recording of what the bridge hands it).
+    const char* sample_what = std::getenv("PS2HOST_REPLAY_SAMPLE");
+    const bool sample_renderer = sample_what && std::string(sample_what) == "renderer";
+    if (sample_renderer) SetSampleRendererThread(true);
     if (gpu) {
         std::string error;
         if (!StartGpuRenderer(&error, GpuMode::Primary, false)) {
@@ -85,6 +98,13 @@ int GsReplay(const std::string& file, const std::string& out) {
         g.trace_out = trace;
         g.trace = true;
     }
+    // PS2HOST_GS_SPLIT=1: through the GS's threads as a game's run feeds them
+    // (the decoding on its own), synced at each vertical blank.
+    const bool threaded = GsSplit();
+    if (threaded) {
+        if (sample_what && !sample_renderer) SetSampleGsThread(true);
+        StartGsThread();
+    }
     std::size_t at = 5 + kMemory;
     auto u32_at = [&](std::size_t o) { u32 v; std::memcpy(&v, data.data() + o, 4); return v; };
     auto u64_at = [&](std::size_t o) { u64 v; std::memcpy(&v, data.data() + o, 8); return v; };
@@ -95,14 +115,17 @@ int GsReplay(const std::string& file, const std::string& out) {
     const int repeat = std::getenv("PS2HOST_REPLAY_REPEAT") ? std::atoi(std::getenv("PS2HOST_REPLAY_REPEAT")) : 0;
     int pass = 0;
     std::chrono::steady_clock::time_point started;
+    double cpu_started = 0, renderer_started = 0;
     for (;;) {
     while (at < data.size()) {
         const char kind = char(data[at++]);
         if (kind == 'R') {
-            g.WriteRegister(u32_at(at), u64_at(at + 4));
+            if (threaded) GsRegister(u32_at(at), u64_at(at + 4));
+            else g.WriteRegister(u32_at(at), u64_at(at + 4));
             at += 12;
         } else if (kind == 'P') {
-            g.SetPrivileged(u32_at(at), u64_at(at + 4));
+            if (threaded) GsPrivileged(u32_at(at), u64_at(at + 4));
+            else g.SetPrivileged(u32_at(at), u64_at(at + 4));
             at += 12;
         } else if (kind == 'W') {
             const int path = data[at];
@@ -115,7 +138,9 @@ int GsReplay(const std::string& file, const std::string& out) {
             // (memory then, to compare two renderers mid-frame).
             static const long long stop = std::getenv("PS2HOST_REPLAY_STOP_PRIM")
                                               ? std::atoll(std::getenv("PS2HOST_REPLAY_STOP_PRIM")) : -1;
-            if (stop < 0) {
+            if (threaded) {
+                GsWords(path, words.data(), u32(words.size()));
+            } else if (stop < 0) {
                 g.Words(path, words.data(), u32(words.size()));
             } else {
                 bool stopped = false;
@@ -129,6 +154,7 @@ int GsReplay(const std::string& file, const std::string& out) {
                 }
             }
         } else if (kind == 'V') {
+            if (threaded) SyncGs();
             g.Finish();
             if (timing) {
                 if (gpu) GpuShadowFrame(u64(pictures), std::string());
@@ -149,6 +175,7 @@ int GsReplay(const std::string& file, const std::string& out) {
         }
     }
     if (pass == 0 && trace) {           // the trace of the first pass alone
+        if (threaded) SyncGs();
         g.trace = false;
         g.trace_out = stderr;
         std::fclose(trace);
@@ -156,23 +183,30 @@ int GsReplay(const std::string& file, const std::string& out) {
     }
     if (pass == 0) {
         if (repeat > 0 && std::getenv("PS2HOST_REPLAY_SAMPLE")) {
-            StartSampler();
+            if (!threaded && !sample_renderer) StartSampler();      // (split: the GS thread's, started with it; the renderer's: with it)
             SetSampleFrom(0);
             SampleFrame(0);
         }
         started = std::chrono::steady_clock::now();
+        cpu_started = ThreadCpuMs();
+        renderer_started = RendererThreadCpuMs();
     }
     if (pass++ >= repeat) break;
     timing = true;
     at = stream;
     }
+    if (threaded) StopGsThread();
     g.Finish();
     if (repeat > 0) {
         // To the last drawn: a block read back waits for the GPU (and for a
         // renderer on a thread of its own, its queue).
         if (gpu && g.on_memory) g.on_memory(0, 1, false);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-        std::fprintf(stderr, "gs-replay: %d passes, %.2f ms a pass (%d pictures each)\n", repeat, ms / repeat, pictures);
+        // The thread's own CPU as well: with a renderer on a thread of its
+        // own the passes' time may be that thread's (or the GPU's), not this.
+        std::fprintf(stderr, "gs-replay: %d passes, %.2f ms a pass (%d pictures each), this thread's CPU %.2f ms a pass, the renderer's %.2f\n",
+                     repeat, ms / repeat, pictures, (ThreadCpuMs() - cpu_started) / repeat,
+                     (RendererThreadCpuMs() - renderer_started) / repeat);
         if (std::getenv("PS2HOST_REPLAY_SAMPLE"))
             std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
     }
@@ -199,6 +233,10 @@ std::unordered_map<u32, FunctionEntry> g_overrides;
 bool g_trace = false;
 bool g_all_notes = false;
 std::vector<u32> g_watch;
+bool g_watching = false;        // !g_watch.empty(), for Dispatch's fast path (a vector's load a call)
+// Each call counted (the report's "most called": a scripted run's, or PS2HOST_CALL_COUNTS=1): the count's
+// increment missed the cache a call - at 144 pictures a second a tenth of the EE's time.
+bool g_count_calls = false;
 std::set<std::string> g_noted;
 
 // Calls already made, by address: the function and its call count, so a call
@@ -206,7 +244,7 @@ std::set<std::string> g_noted;
 // of thousands). Cleared when an override replaces a function.
 struct CachedCall {
     u32 address = 0;
-    const FunctionEntry* entry = nullptr;
+    GuestFunction function = nullptr;   // (the entry's own, here: no second load from the table)
     u64* count = nullptr;
 };
 constexpr std::size_t kCallCache = 1u << 14;
@@ -408,12 +446,12 @@ void Note(const std::string& key, const std::string& text) {
 
 void Dispatch(lifted::Context& c, u32 address) {
     CachedCall& line = g_call_cache[(address >> 2) & (kCallCache - 1)];
-    if (line.address == address && line.entry && g_watch.empty()) {
-        ++*line.count;
+    if (line.address == address && line.function && !g_watching) {
+        if (g_count_calls) ++*line.count;
         if (g_trace) std::fprintf(stderr, "[call] %s\n", Describe(address).c_str());
         Frame frame(address);
         try {
-            line.entry->function(c);
+            line.function(c);
         } catch (...) {
             if (RunStats().stopped_in.empty()) {
                 RunStats().stopped_in = CurrentCalls();
@@ -441,8 +479,8 @@ void Dispatch(lifted::Context& c, u32 address) {
     u64& count = RunStats().calls[address];
     if (++count == 1 || g_trace)
         std::fprintf(stderr, "[call] %s\n", Describe(address).c_str());
-    if (cacheable) line = CachedCall{address, entry, &count};
-    if (std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end()) {
+    if (cacheable) line = CachedCall{address, entry->function, &count};
+    if (g_watching && std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end()) {
         std::fprintf(stderr, "[watch] %s a0=%016llX a1=%016llX a2=%016llX a3=%016llX "
                      "f12=%08X f13=%08X ra=%08X s0=%08X s1=%08X sp=%08X gp=%08X t0=%08X\n",
                      Describe(address).c_str(),
@@ -463,7 +501,7 @@ void Dispatch(lifted::Context& c, u32 address) {
         }
         throw;
     }
-    if (std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end())
+    if (g_watching && std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end())
         std::fprintf(stderr, "[watch] %s returned v0=%016llX f0=%08X s0=%08X s1=%08X sp=%08X\n",
                      Describe(address).c_str(), (unsigned long long)c.r[2], c.f[0],
                      unsigned(c.r[16]), unsigned(c.r[17]), unsigned(c.r[29]));
@@ -709,6 +747,7 @@ int Run(const Options& options) {
         SetSampleFrom(u64(options.sample_from));
         if (options.sample_gs) SetSampleGsThread(true);
         else if (options.sample_vif1) SetSampleVif1Thread(true);
+        else if (options.sample_renderer) SetSampleRendererThread(true);
         else StartSampler();
     }
     if (!options.vu_record.empty()) Vu::RecordPrograms(options.vu_record);
@@ -716,7 +755,6 @@ int Run(const Options& options) {
     if (options.vu_interpret) Vu1().use_compiled = Vu0().use_compiled = false;
     Vu1().fast = options.vu_fast || (g_vu_fast_default && !options.vu_exact && SettingOn("vu_fast", true));
     if (Vu1().fast && !options.vu_fast) std::fprintf(stderr, "[host] VU1 fast mode (the game's default; --vu-exact for the exact flags)\n");
-    Vu1().native = Vu0().native = options.vu_native;
     SetUntilFrame(options.until_frame);
     SetFrameTimes(options.frame_times);
     if (options.gpu || options.gpu_shadow) {
@@ -746,6 +784,8 @@ int Run(const Options& options) {
     if (!options.frames_dir.empty())
         SetFrameDumps(options.frames_dir, options.frames_every, options.frames_limit, u64(options.frames_from));
     g_watch = options.watch;
+    g_watching = !g_watch.empty();
+    g_count_calls = (options.virtual_time && !options.real_time_from) || std::getenv("PS2HOST_CALL_COUNTS") != nullptr;
     InstallDevices();
     InstallIopServers();
     if (!options.gs_inline) StartGsThread();
@@ -833,6 +873,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--sample") options.sample = true;
         else if (arg == "--sample-gs") options.sample = options.sample_gs = true;
         else if (arg == "--sample-vif1") options.sample = options.sample_vif1 = true;
+        else if (arg == "--sample-renderer") options.sample = options.sample_renderer = true;
         else if (arg == "--vif1-sync") options.vif1_sync = true;
         else if (arg == "--fast-disc") options.fast_disc = true;
         else if (arg == "--check-guesses") options.check_guesses = true;
@@ -853,13 +894,19 @@ int Main(int argc, char** argv) {
         else if (arg == "--vu-record" && i + 1 < argc) options.vu_record = argv[++i];
         else if (arg == "--vu-interpret") options.vu_interpret = true;
         else if (arg == "--vu-fast") options.vu_fast = true;
-        else if (arg == "--vu-native") options.vu_native = true;
-        else if (arg == "--vu-exact") {
-            options.vu_native = false;
-            options.vu_exact = true;
-        }
+        else if (arg == "--vu-exact") options.vu_exact = true;
         else if (arg == "--memcard" && i + 1 < argc) options.memcard = argv[++i];
         else if (arg == "--setting" && i + 1 < argc) options.settings.push_back(argv[++i]);
+        else if (arg == "--setting-at" && i + 1 < argc) {
+            // --setting-at KEY=VALUE@FRAME: changed mid-run (settings.h).
+            const std::string spec = argv[++i];
+            const std::size_t equals = spec.find('='), at = spec.rfind('@');
+            if (equals == std::string::npos || at == std::string::npos || at < equals)
+                std::fprintf(stderr, "--setting-at %s: KEY=VALUE@FRAME\n", spec.c_str());
+            else
+                ScheduleSetting(spec.substr(0, equals), spec.substr(equals + 1, at - equals - 1),
+                                std::stoull(spec.substr(at + 1)));
+        }
         else if (arg == "--audio") options.audio = true;
         else if (arg == "--audio-wav" && i + 1 < argc) options.audio_wav = argv[++i];
         else if (arg == "--press" && i + 1 < argc) {
@@ -937,8 +984,8 @@ int Main(int argc, char** argv) {
             SetSampleFrom(0);
             SampleFrame(0);
         }
-        const int status = Vu::Bench(options.vu_bench, options.sample ? 100 : 5, options.vu_fast, options.vu_native);
-        if (options.sample) std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
+        const int status = Vu::Bench(options.vu_bench, options.sample ? 100 : 5, options.vu_fast);
+        if (options.sample) std::printf("%s", SampleReport().c_str());
         return status;
     }
     if (options.elf_path.empty() && options.disc_path.empty()) {

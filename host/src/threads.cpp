@@ -50,7 +50,9 @@
 #include "ps2host/iop_vm.h"
 #include "ps2host/memory.h"
 #include "ps2host/run.h"
+#include "ps2host/settings.h"
 #include "ps2host/profile.h"
+#include "ps2host/refresh_lock.h"
 
 namespace ps2host {
 
@@ -298,6 +300,7 @@ bool g_paced = false;                   // SetPaced
 bool DeliverFrame() {
     Scheduler& s = S();
     ++s.frames;
+    ApplyScheduledSettings(s.frames);
     if (g_paced && s.virtual_time) {
         // No sooner than the display's next blank (NTSC's 59.94 a second): the
         // run stays exact, only slowed to where it can be played.
@@ -468,12 +471,82 @@ bool SpareCores() {
     return spare.load(std::memory_order_relaxed);
 }
 
+// The timer locked to the screen's refresh (refresh_lock.h): the timer
+// thread's; what RefreshLocked tells other threads, published as it steps.
+refresh_lock::Lock g_refresh_lock;
+std::atomic<bool> g_refresh_locked{false};
+std::atomic<double> g_locked_period{0.0};
+std::atomic<u64> g_locked_anchor{0};
+std::atomic<u64> g_refresh_lead{0};             // SetRefreshLead
+
+/* Whether the lock is wanted: PS2HOST_REFRESH_LOCK=0/1, else the
+   "refresh_lock" setting (on by default) unless VRR's on (its refresh
+   follows the pictures). Looked at every few hundred blanks. */
+bool RefreshLockWanted() {
+    static const char* env = std::getenv("PS2HOST_REFRESH_LOCK");
+    if (env) return env[0] == '1';
+    static unsigned looks = 0;
+    static bool wanted = true;
+    if (looks++ % 256 == 0) wanted = SettingOn("refresh_lock", true) && !SettingOn("vrr");
+    return wanted;
+}
+
+/* The step to the blank after `next`: the game's own (`nominal`), or, locked,
+   a whole number of the screen's refreshes, nudged onto its blanks. */
+std::chrono::steady_clock::duration LockedStep(std::chrono::steady_clock::duration nominal,
+                                               std::chrono::steady_clock::time_point next) {
+    double period = 0;
+    u64 anchor = 0;
+    const bool valid = RefreshLockWanted() && WindowRefreshTiming(&period, &anchor);
+    const double nominal_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(nominal).count());
+    const u64 next_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count());
+    const unsigned changes = g_refresh_lock.changes();
+    const double step = g_refresh_lock.Step(nominal_ns, next_ns, valid, period, anchor,
+                                            double(g_refresh_lead.load(std::memory_order_relaxed)));
+    const bool locked = g_refresh_lock.state() == refresh_lock::Lock::State::kLocked;
+    if (locked) {
+        g_locked_period.store(g_refresh_lock.period(), std::memory_order_relaxed);
+        g_locked_anchor.store(g_refresh_lock.anchor(), std::memory_order_relaxed);
+    }
+    g_refresh_locked.store(locked, std::memory_order_relaxed);
+    if (g_refresh_lock.changes() != changes) {
+        using State = refresh_lock::Lock::State;
+        switch (g_refresh_lock.state()) {
+            case State::kOff: std::fprintf(stderr, "[refresh] the blanks by the processor's clock\n"); break;
+            case State::kPulling:
+                std::fprintf(stderr, "[refresh] the blanks pulling in to the screen's: %d of its %.4f ms refreshes each\n",
+                             g_refresh_lock.refreshes(), period / 1e6);
+                break;
+            case State::kLocked: std::fprintf(stderr, "[refresh] the blanks locked to the screen's\n"); break;
+            case State::kGaveUp:
+                std::fprintf(stderr, "[refresh] the screen's refresh follows the pictures (VRR?): the blanks by the "
+                                     "processor's clock\n");
+                break;
+        }
+    }
+    return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::nanoseconds(std::llround(step)));
+}
+
 void VblankTimer() {
     using clock = std::chrono::steady_clock;
     const auto period = std::chrono::microseconds(16683);      // NTSC, 59.94 Hz
     const auto margin = std::chrono::microseconds(700);    // the precise sleep's (SleepUntil), then a spin
     auto next = clock::now() + period;
+    u64 period_seen = BlankPeriodNs();
     while (!StopRequested() && !g_timer_stop) {
+        // The blanks quicker from now (a high frame rate taken up): the one
+        // waited for a period of the new rate after the last, not the old
+        // rate's - a picture each blank, the first after the change shown
+        // a whole old period after the one before (28 ms at 60 to 144).
+        if (const u64 period_now = BlankPeriodNs(); period_now != period_seen) {
+            if (period_now < period_seen && g_last_vblank_ns.load(std::memory_order_relaxed)) {
+                const clock::time_point sooner{std::chrono::duration_cast<clock::duration>(std::chrono::nanoseconds(
+                    g_last_vblank_ns.load(std::memory_order_relaxed) + period_now))};
+                next = std::min(next, std::max(sooner, clock::now()));
+            }
+            period_seen = period_now;
+        }
         // Sleep to the next vertical blank, or to an EE timer's interrupt if that
         // comes first.
         Scheduler& s = S();
@@ -533,10 +606,14 @@ void VblankTimer() {
             unsigned factor = g_fast_forward.load(std::memory_order_relaxed);
             if (S().frames < g_fast_until.load(std::memory_order_relaxed)) factor = std::max(factor, g_fast_until_factor.load(std::memory_order_relaxed));
             const s64 own = g_blank_period_ns.load(std::memory_order_relaxed);
-            next += factor > 1 ? period / factor
-                    : own > 0  ? std::chrono::duration_cast<clock::duration>(std::chrono::nanoseconds(own))
-                               : period;
-            if (clock::now() >= next + period) next = clock::now() + period;   // a stall: start again from now
+            next += LockedStep(factor > 1 ? clock::duration(period / factor)
+                               : own > 0  ? std::chrono::duration_cast<clock::duration>(std::chrono::nanoseconds(own))
+                                          : clock::duration(period),
+                               next);
+            if (clock::now() >= next + period) {        // a stall: start again from now
+                next = clock::now() + period;
+                g_refresh_lock.Pull();
+            }
             if (g_hitch_blanks && !s.vblank_due.load())
                 g_blank_due_ns.store(ClockNs(), std::memory_order_relaxed);
             if (s.vblank_due.exchange(true)) {
@@ -577,6 +654,10 @@ std::unordered_set<u32>& IdleLoops() {
     return loops;
 }
 constexpr s64 kIdleSliceIterations = 256;
+// ...in real time, between its waits: an idle loop runs on only to see what
+// woke it (Burnout 3's packet wait calls a function each turn: at 144
+// pictures a second its 256 turns a wake were a third of the EE's time).
+constexpr s64 kRealtimeIdleSliceIterations = 16;
 
 // lifted::loop_head_hook: a spent budget is either this host's request to
 // deliver interrupts, or the end of the run.
@@ -629,7 +710,7 @@ void LoopHead(lifted::Context& c, u32 address) {
     s.current->delivery_requested = false;
     c.budget = requested ? s.current->saved_budget
              : s.virtual_time ? (idle ? kIdleSliceIterations : kSliceIterations)
-             : realtime_idle ? kIdleSliceIterations : s.loop_budget;
+             : realtime_idle ? kRealtimeIdleSliceIterations : s.loop_budget;
     if (StopRequested()) c.budget = -1;         // the watchdog fired meanwhile
     // In real time the timer may have spent the budget since the blank and
     // timers were looked at: its spend kept (VblankTimer).
@@ -653,6 +734,24 @@ void LoopHead(lifted::Context& c, u32 address) {
 }  // namespace
 
 void AddIdleLoop(u32 address) { IdleLoops().insert(address); }
+
+void WaitForGuestEvent() {
+    Scheduler& s = S();
+    if (!s.realtime || s.in_interrupt || !s.current) return;
+    const auto idle_from = std::chrono::steady_clock::now();
+    for (;;) {
+        u32 seen = g_timer_seq.load(std::memory_order_acquire);
+        if (s.vblank_due || s.timer_due || s.current->delivery_requested || StopRequested() || IopReplyPending())
+            break;
+        WaitOnAddress(&g_timer_seq, &seen, sizeof seen, 2);
+    }
+    g_idle_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - idle_from).count()),
+                        std::memory_order_relaxed);
+    IdleSpan(idle_from);
+    // What woke it, delivered at the loop's next head.
+    if (s.vblank_due || s.timer_due) SpendBudget(s.current->context);
+}
 
 InterruptWait::InterruptWait() { g_interrupt_waits.fetch_add(1, std::memory_order_relaxed); }
 InterruptWait::~InterruptWait() { g_interrupt_waits.fetch_sub(1, std::memory_order_relaxed); }
@@ -710,10 +809,15 @@ void PostDmac(u32 channel) {
 void DeliverIopPacketNow() {
     Scheduler& s = S();
     // RunHandlers has one interrupt context: never inside a handler. The IOP
-    // answers in order: what is due before the packet goes first.
-    if (s.in_interrupt) return;
-    while (DeliverIopReply()) {
-    }
+    // answers in order, so only a packet with nothing before it goes now: the
+    // EE's threads cannot run inside the IOP's run, and every answer its
+    // threads had queued, delivered here with it, reached the EE's handler
+    // with none of them taken in between - Burnout 3's RenderWare Audio
+    // keeps 24 and drops the rest; a dropped state of its music stream left
+    // a loading screen waiting for ever. What waits goes at the next loop
+    // head, its thread let run after each.
+    if (s.in_interrupt || IopRepliesQueued() != 1) return;
+    DeliverIopReply();
 }
 
 void RequestDelivery() {
@@ -1339,7 +1443,16 @@ bool RunIopBetweenSteps() {
 }
 
 bool BlankDue() { return S().vblank_due.load(std::memory_order_relaxed); }
+bool RefreshLocked(double* period_ns, u64* blank_ns) {
+    if (!g_refresh_locked.load(std::memory_order_relaxed)) return false;
+    *period_ns = g_locked_period.load(std::memory_order_relaxed);
+    *blank_ns = g_locked_anchor.load(std::memory_order_relaxed);
+    return *period_ns > 0;
+}
+
 u64 LastVblankNs() { return g_last_vblank_ns.load(std::memory_order_relaxed); }
+
+void SetRefreshLead(u64 ns) { g_refresh_lead.store(ns, std::memory_order_relaxed); }
 
 void FastThread() {
     THREAD_POWER_THROTTLING_STATE throttling{};
