@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -211,11 +212,17 @@ struct Texture {
 
 // What the frames' command buffers hold (RendererCounters, PS2HOST_GPU_LOG).
 std::uint64_t g_barriers = 0, g_transitions = 0, g_dispatches = 0, g_draws = 0, g_passes = 0, g_feedback = 0;
+std::uint64_t g_feedback_blend = 0;     // of them, for the shader's blending alone (its own pixel: no texture of itself)
 // Why each pass ended (RendererCounters): a draw's destination alpha test,
 // its copy of its own target, a source to make readable, another target,
 // another depth buffer; anything else recorded (VulkanGpu::end_pass).
 enum PassEnd { kEndDate, kEndFeedback, kEndSource, kEndTarget, kEndDepth, kEndOther, kEndWhys };
 std::uint64_t g_pass_ends[kEndWhys] = {};
+// Deferred passes (PS2HOST_GPU_COUNT): the pixels their render areas took, of
+// their images' whole; the depth-stencils neither stored nor loaded.
+std::uint64_t g_area_used = 0, g_area_whole = 0, g_depth_unstored = 0, g_depth_unloaded = 0;
+std::uint64_t g_beside = 0;     // work recorded beside an open deferred pass (RecordBeside)
+std::uint64_t g_renamed = 0;    // textures decoded into another image for it (TextureFromMemory)
 
 void Transition(VkCommandBuffer cmd, Image& t, VkImageLayout to, VkAccessFlags dst_access,
                 VkPipelineStageFlags dst_stage) {
@@ -318,6 +325,22 @@ bool Is16Bit(std::uint32_t psm) { return psm == 0x02 || psm == 0x0A || psm == 0x
 
 /* Dual-source blending (the factor a second output): Blender16 needs it. */
 bool g_dual_source_blend = false;
+/* Without logic ops (VkPhysicalDeviceFeatures::logicOp: Mali, an older
+   phone's GPU; PS2HOST_GPU_NO_LOGIC_OP=1 to compare): a channel FBMSK masks
+   in part drawn with the blend in the shader, which keeps the masked bits
+   from its copy of the target - exactly, whatever the blend. */
+bool g_masks_in_shader = false;
+// (A 16-bit target's channels are its five bits, and its alpha's one: the
+// low bits it has not are zeros either way, no reason to blend here.)
+bool MaskedInShader(const GsDrawState& s) {
+    if (!g_masks_in_shader) return false;
+    if (!Is16Bit(s.psm)) return PartlyMasked(KeptBits(s.fbmsk, s.psm));
+    for (const std::uint32_t field : {0xF8u, 0xF800u, 0xF80000u, 0x80000000u}) {
+        const std::uint32_t kept = s.fbmsk & field;
+        if (kept != 0 && kept != field) return true;
+    }
+    return false;
+}
 
 /* How the blender can make a 16-bit target's blend exactly, the GS's five
    bits a channel, without the shader reading a copy of the target: where
@@ -345,6 +368,7 @@ int Blender16(const GsDrawState& s) {
 }
 
 bool ShaderBlend(const GsDrawState& s) {
+    if (MaskedInShader(s)) return true;
     if (!s.blend) return false;
     // Into a 16-bit target: the blend's result cut to five bits a channel,
     // as the GS stores it (the blender would keep eight: the next blend over
@@ -373,6 +397,8 @@ constexpr std::uint32_t kShaderBlend = 1u << 15;
    in the shader. */
 std::uint32_t PipelineKey(const GsDrawState& s) {
     const std::uint32_t masked = (~WriteMask(KeptBits(s.fbmsk, s.psm)) & 0xF) << 9;
+    if (MaskedInShader(s))      // (the shader's blend: its operands are the parameters')
+        return masked | (s.blend ? 1u : 0u) | kShaderBlend;
     if (!s.blend) return masked;
     if (const int way = Blender16(s)) {
         // S written, or Cd + S, Cd - |S| (the shader's S, its factor 1): as
@@ -560,6 +586,29 @@ private:
     std::vector<VkDeviceMemory> image_blocks_;
     void Fill(Texture& texture, const std::uint32_t* pixels);
     VkPipeline PipelineFor(std::uint32_t key);
+    /* Without extended dynamic state (g_vk_baked_states): a GS draw's
+       pipeline with its depth and stencil states and the ranges' stride made
+       in - Baked's bits beside the key - rather than set per batch. Known by
+       BakedId; made by the worker as the dynamic ones are (the whole shader's
+       with the same states standing in), the last runs' from the start
+       (gpu_pipelines_baked.txt). */
+    static constexpr std::uint32_t kDynamicStates = ~0u;
+    static constexpr std::uint32_t kBakedDepthTest = 1, kBakedDepthWrite = 2, kBakedRanges = 64;
+    static std::uint32_t Baked(int depth_test, int depth_write, int compare, int stencil_test, bool ranges) {
+        return (depth_test ? kBakedDepthTest : 0) | (depth_write ? kBakedDepthWrite : 0) | std::uint32_t(compare) << 2 |
+               std::uint32_t(stencil_test) << 4 | (ranges ? kBakedRanges : 0);
+    }
+    VkPipeline BakedPipelineFor(std::uint32_t key, std::uint32_t baked);
+    /* A pipeline's id for the worker and the lists: the key, and above it
+       its baked states + 1 (0: the dynamic pipeline). */
+    static std::uint64_t BakedId(std::uint32_t key, std::uint32_t baked) {
+        return (std::uint64_t(baked) + 1) << 32 | key;
+    }
+    void KeepBaked(std::uint64_t id, VkPipeline pipeline);
+    std::unordered_map<std::uint64_t, VkPipeline> baked_pipelines_;
+    std::set<std::uint64_t> known_baked_;
+    std::uint64_t last_baked_key_ = ~0ull;
+    VkPipeline last_baked_ = VK_NULL_HANDLE;
     /* The pipeline cache (SetPipelineCacheDir): every pipeline is made
        through it; the keys PipelineFor has made, kept to make again at the
        next start (WarmPipelines); written back now and then as they grow
@@ -669,11 +718,114 @@ private:
     void EndPass(VkCommandBuffer cmd, PassEnd why = kEndOther) {
         if (!open_target_) return;
         ++g_pass_ends[why];
-        vkCmdEndRendering(cmd);
+        if (pass_cmd_) {
+            BeginDeferredPass(cmd);
+        } else {
+            EndRendering(cmd);
+        }
         open_target_ = open_depth_ = nullptr;
+    }
+    /* A rendering pass begun and ended: dynamic rendering (Vulkan 1.3, or
+       1.2's extension), else (kVk12RenderPass) the same as a render pass with
+       its framebuffer, whose size is `whole` (the attachments' common size,
+       which the render area lies in). */
+    void BeginRendering(VkCommandBuffer cmd, const VkRenderingInfo& ri, VkExtent2D whole);
+    void EndRendering(VkCommandBuffer cmd) {
+        if (g_vk_path == kVk12RenderPass) vkCmdEndRenderPass(cmd);
+        else vkCmdEndRendering(cmd);
+    }
+    /* Render passes (kVk12RenderPass): a compatible one for each attachment
+       set - [0] depth-stencil alone, [1] colour and depth-stencil - that
+       pipelines and deferred secondaries are made for; the ones begun, by
+       their attachments' load and store ops; framebuffers by their views and
+       size, dropped with their images (DestroyImage). */
+    VkRenderPass compatible_passes_[2] = {};
+    std::unordered_map<std::uint32_t, VkRenderPass> render_passes_;
+    struct FramebufferKey {
+        VkImageView colour, depth;
+        std::uint32_t width, height;
+        bool operator==(const FramebufferKey& o) const {
+            return colour == o.colour && depth == o.depth && width == o.width && height == o.height;
+        }
+    };
+    struct FramebufferKeyHash {
+        std::size_t operator()(const FramebufferKey& k) const {
+            return std::hash<const void*>()(reinterpret_cast<const void*>(k.colour)) * 31 ^
+                   std::hash<const void*>()(reinterpret_cast<const void*>(k.depth)) ^
+                   (std::size_t(k.width) << 20 | k.height);
+        }
+    };
+    std::unordered_map<FramebufferKey, VkFramebuffer, FramebufferKeyHash> framebuffers_;
+    VkRenderPass RenderPass(bool colour, std::uint32_t ops);
+    bool MakeCompatiblePasses();
+    /* What a pipeline or a deferred secondary drawing into colour and depth
+       (or depth alone) is made for: the compatible render pass on
+       kVk12RenderPass, else none (dynamic rendering). */
+    VkRenderPass CompatiblePass(bool colour) const {
+        return g_vk_path == kVk12RenderPass ? compatible_passes_[colour ? 1 : 0] : VK_NULL_HANDLE;
+    }
+    /* Deferred passes (a tiler's - Android's - or PS2HOST_GPU_DEFER_PASSES=1):
+       a pass's draws recorded into a secondary command buffer, the pass
+       itself begun only as it ends - its render area then the draws' own
+       (tiles outside it neither loaded nor stored), the depth-stencil
+       stored only if a draw wrote it, loaded only if one read it. */
+    bool defer_passes_ = false;
+    VkCommandBuffer pass_cmd_ = VK_NULL_HANDLE;
+    VkRenderingAttachmentInfo pass_colour_{}, pass_z_{};
+    VkRect2D pass_area_{};                  // the image's whole, at the pass's start
+    std::int32_t pass_x0_ = 0, pass_y0_ = 0, pass_x1_ = 0, pass_y1_ = 0;    // the draws' bounds (x1, y1 past)
+    bool pass_drew_ = false, pass_depth_read_ = false, pass_depth_written_ = false;
+    std::vector<VkImage> pass_sampled_;     // the images the open deferred pass's draws read
+    /* Work recorded beside the open deferred pass - ahead of it, the pass
+       left open - where it writes nothing the pass's draws read: no image of
+       theirs (`image`, or none: VK_NULL_HANDLE) and not the CLUT buffer
+       (`clut`), which every draw reads (gs.frag's set 1). Else the pass ends
+       first, as always. */
+    template <typename F>
+    void RecordBeside(VkImage image, bool clut, F&& record) {
+        if (pass_cmd_ && !clut &&
+            (!image || std::find(pass_sampled_.begin(), pass_sampled_.end(), image) == pass_sampled_.end())) {
+            ++g_beside;
+            g_.RecordInPass(std::forward<F>(record));
+        } else {
+            g_.Record(std::forward<F>(record));
+        }
+    }
+    void BeginDeferredPass(VkCommandBuffer cmd) {
+        vkEndCommandBuffer(pass_cmd_);
+        const VkCommandBuffer drawn = pass_cmd_;
+        pass_cmd_ = VK_NULL_HANDLE;
+        if (!pass_drew_) return;                // (nothing drawn: no pass at all)
+        const std::int32_t right = std::int32_t(pass_area_.extent.width), bottom = std::int32_t(pass_area_.extent.height);
+        const std::int32_t x0 = std::clamp(pass_x0_, 0, right), y0 = std::clamp(pass_y0_, 0, bottom);
+        const std::int32_t x1 = std::clamp(pass_x1_, x0, right), y1 = std::clamp(pass_y1_, y0, bottom);
+        if (x1 <= x0 || y1 <= y0) return;
+        VkRenderingAttachmentInfo colour = pass_colour_, z = pass_z_;
+        if (!pass_depth_written_ && g_store_op_none) {
+            z.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
+            ++g_depth_unstored;
+        }
+        if (!pass_depth_read_ && !pass_depth_written_ && g_load_op_none) {
+            z.loadOp = VK_ATTACHMENT_LOAD_OP_NONE_EXT;
+            ++g_depth_unloaded;
+        }
+        g_area_used += std::uint64_t(x1 - x0) * std::uint64_t(y1 - y0);
+        g_area_whole += std::uint64_t(right) * std::uint64_t(bottom);
+        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+        ri.renderArea = {{x0, y0}, {std::uint32_t(x1 - x0), std::uint32_t(y1 - y0)}};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &colour;
+        ri.pDepthAttachment = &z;
+        ri.pStencilAttachment = &z;
+        BeginRendering(cmd, ri, pass_area_.extent);
+        vkCmdExecuteCommands(cmd, 1, &drawn);
+        EndRendering(cmd);
     }
     VkPipeline date_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorSet SetFor(Texture& texture, int sampler);
+    void RetireTexture(Texture texture);
     void WriteTextureSet(VkDescriptorSet set, VkSampler sampler, const Image& image);
     bool Buffer(VkDeviceSize bytes, VkBufferUsageFlags usage, VkBuffer* buffer, VkDeviceMemory* memory, void** mapped);
 
@@ -703,16 +855,16 @@ private:
        with the whole shader (the same pictures) - none made in the middle of
        a frame. Scripted runs (no pipeline cache) make them at once. */
     bool async_pipelines_ = false;
-    std::thread pipeline_worker_;
+    std::vector<std::thread> pipeline_workers_;
     std::mutex pipeline_lock_;
     std::condition_variable pipeline_wake_;
-    std::deque<std::uint32_t> pipeline_queue_;
-    std::vector<std::pair<std::uint32_t, VkPipeline>> pipelines_made_;
-    std::set<std::uint32_t> pipelines_asked_;
+    std::deque<std::uint64_t> pipeline_queue_;         // (keys, and BakedIds)
+    std::vector<std::pair<std::uint64_t, VkPipeline>> pipelines_made_;
+    std::set<std::uint64_t> pipelines_asked_;          // (keys, and BakedIds)
     std::atomic<bool> pipelines_ready_{false};
     bool pipeline_stop_ = false;
-    VkPipeline MakePipeline(std::uint32_t key);
-    void AskWorker(std::uint32_t key, bool soon);
+    VkPipeline MakePipeline(std::uint32_t key, std::uint32_t baked = kDynamicStates);
+    void AskWorker(std::uint64_t id, bool soon);
     std::size_t warm_left_ = 0;         // WarmPipelines' still to come
     std::chrono::steady_clock::time_point warm_began_{};
     void KeepPipeline(std::uint32_t key, VkPipeline pipeline, double ms);
@@ -1059,7 +1211,7 @@ bool VulkanGsRenderer::MakeImage(Image& t, std::uint32_t width, std::uint32_t he
     formats.pViewFormats = both;
     if (words) {
         ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-        ici.pNext = &formats;
+        if (g_image_format_list) ici.pNext = &formats;
     }
     if (vkCreateImage(g_.device, &ici, nullptr, &t.image) != VK_SUCCESS) return false;
     VkMemoryRequirements req;
@@ -1087,6 +1239,16 @@ bool VulkanGsRenderer::MakeImage(Image& t, std::uint32_t width, std::uint32_t he
 }
 
 void VulkanGsRenderer::DestroyImage(Image& t) {
+    if (!framebuffers_.empty() && t.view) {
+        for (auto it = framebuffers_.begin(); it != framebuffers_.end();) {
+            if (it->first.colour == t.view || it->first.depth == t.view) {
+                vkDestroyFramebuffer(g_.device, it->second, nullptr);
+                it = framebuffers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     effects_.ForgetView(t.view);
     if (t.view) vkDestroyImageView(g_.device, t.view, nullptr);
     if (t.words) vkDestroyImageView(g_.device, t.words, nullptr);
@@ -1141,7 +1303,16 @@ void VulkanGsRenderer::FreeImageMemory(VkDeviceMemory memory, VkDeviceSize offse
 }
 
 bool VulkanGsRenderer::Init(std::string* error) {
+    // Deferred passes: a tiler's (a phone's); PS2HOST_GPU_DEFER_PASSES=1 or 0 decides.
+    if (const char* defer = std::getenv("PS2HOST_GPU_DEFER_PASSES")) defer_passes_ = defer[0] == '1';
+#ifdef __ANDROID__
+    else defer_passes_ = true;
+#endif
     OpenPipelineCache();
+    if (g_vk_path == kVk12RenderPass && !MakeCompatiblePasses()) {
+        if (error) *error = "vkCreateRenderPass failed";
+        return false;
+    }
     auto module = [&](const std::uint32_t* code, std::size_t bytes) {
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = bytes;
@@ -1154,6 +1325,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
     frag_ = g_.dual_source ? module(spirv_gs_frag, sizeof spirv_gs_frag)
                            : module(spirv_gs_frag_single, sizeof spirv_gs_frag_single);
     g_dual_source_blend = g_.dual_source;
+    g_masks_in_shader = !g_.logic_op || std::getenv("PS2HOST_GPU_NO_LOGIC_OP") != nullptr;
     frag_blend_ = module(spirv_gs_frag_blend, sizeof spirv_gs_frag_blend);
     if (!vert_ || !frag_ || !frag_blend_) {
         if (error) *error = "the GS shaders did not load";
@@ -1218,7 +1390,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
     lci.pushConstantRangeCount = 2;
     lci.pPushConstantRanges = push;
     vkCreatePipelineLayout(g_.device, &lci, nullptr, &layout_);
-    if (!PipelineFor(0) || !MakeDatePipeline()) {
+    if (!(g_vk_baked_states ? BakedPipelineFor(0, 0) : PipelineFor(0)) || !MakeDatePipeline()) {
         if (error) *error = "vkCreateGraphicsPipelines failed";
         return false;
     }
@@ -1559,7 +1731,8 @@ bool VulkanGsRenderer::MakeDepthPipelines() {
     rendering.depthAttachmentFormat = kDepthFormat;
     rendering.stencilAttachmentFormat = kDepthFormat;
     VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pci.pNext = &rendering;
+    pci.renderPass = CompatiblePass(false);
+    if (!pci.renderPass) pci.pNext = &rendering;
     pci.stageCount = 2;
     pci.pStages = stages;
     pci.pVertexInputState = &input;
@@ -1573,6 +1746,124 @@ bool VulkanGsRenderer::MakeDepthPipelines() {
     pci.layout = depth_load_layout_;
     return vkCreateGraphicsPipelines(g_.device, cache_, 1, &pci, nullptr, &depth_load_pipeline_) ==
            VK_SUCCESS;
+}
+
+namespace {
+/* Load and store ops in two bits each (RenderPass's key; 0 is LOAD, STORE). */
+std::uint32_t LoadBits(VkAttachmentLoadOp op) {
+    return op == VK_ATTACHMENT_LOAD_OP_LOAD ? 0u : op == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1u
+           : op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ? 2u : 3u;
+}
+std::uint32_t StoreBits(VkAttachmentStoreOp op) {
+    return op == VK_ATTACHMENT_STORE_OP_STORE ? 0u : op == VK_ATTACHMENT_STORE_OP_DONT_CARE ? 1u : 2u;
+}
+VkAttachmentLoadOp LoadOp(std::uint32_t bits) {
+    static const VkAttachmentLoadOp kOps[4] = {VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                               VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_NONE_EXT};
+    return kOps[bits & 3];
+}
+VkAttachmentStoreOp StoreOp(std::uint32_t bits) {
+    static const VkAttachmentStoreOp kOps[3] = {VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                                                VK_ATTACHMENT_STORE_OP_NONE};
+    return kOps[std::min(bits & 3, 2u)];
+}
+}  // namespace
+
+/* A render pass of one subpass drawing into colour (RGBA8, if `colour`) and
+   the GS's depth-stencil. `ops`: colour's load and store in bits 0-3,
+   depth's in 4-7, stencil's in 8-11 (LoadBits, StoreBits). Every attachment
+   starts and ends in its attachment layout: the renderer moves images
+   between layouts itself, outside passes. */
+VkRenderPass VulkanGsRenderer::RenderPass(bool colour, std::uint32_t ops) {
+    const std::uint32_t key = ops << 1 | (colour ? 1u : 0u);
+    if (auto found = render_passes_.find(key); found != render_passes_.end()) return found->second;
+    VkAttachmentDescription attachments[2] = {};
+    const VkAttachmentReference colour_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    const VkAttachmentReference depth_ref{colour ? 1u : 0u, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    std::uint32_t count = 0;
+    if (colour) {
+        VkAttachmentDescription& c = attachments[count++];
+        c.format = VK_FORMAT_R8G8B8A8_UNORM;
+        c.samples = VK_SAMPLE_COUNT_1_BIT;
+        c.loadOp = LoadOp(ops);
+        c.storeOp = StoreOp(ops >> 2);
+        c.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        c.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        c.initialLayout = c.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+    VkAttachmentDescription& z = attachments[count++];
+    z.format = kDepthFormat;
+    z.samples = VK_SAMPLE_COUNT_1_BIT;
+    z.loadOp = LoadOp(ops >> 4);
+    z.storeOp = StoreOp(ops >> 6);
+    z.stencilLoadOp = LoadOp(ops >> 8);
+    z.stencilStoreOp = StoreOp(ops >> 10);
+    z.initialLayout = z.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = colour ? 1 : 0;
+    subpass.pColorAttachments = colour ? &colour_ref : nullptr;
+    subpass.pDepthStencilAttachment = &depth_ref;
+    VkRenderPassCreateInfo rci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rci.attachmentCount = count;
+    rci.pAttachments = attachments;
+    rci.subpassCount = 1;
+    rci.pSubpasses = &subpass;
+    VkRenderPass pass = VK_NULL_HANDLE;
+    if (vkCreateRenderPass(g_.device, &rci, nullptr, &pass) != VK_SUCCESS) return VK_NULL_HANDLE;
+    render_passes_.emplace(key, pass);
+    return pass;
+}
+
+bool VulkanGsRenderer::MakeCompatiblePasses() {
+    // (Load and store ops do not make passes incompatible: the all-LOAD,
+    // all-STORE ones serve, kept in render_passes_ like the rest.)
+    compatible_passes_[0] = RenderPass(false, 0);
+    compatible_passes_[1] = RenderPass(true, 0);
+    std::fprintf(stderr, "[ps2gpu] drawing with render passes (Vulkan 1.2 without dynamic rendering)\n");
+    return compatible_passes_[0] && compatible_passes_[1];
+}
+
+void VulkanGsRenderer::BeginRendering(VkCommandBuffer cmd, const VkRenderingInfo& ri, VkExtent2D whole) {
+    if (g_vk_path != kVk12RenderPass) {
+        vkCmdBeginRendering(cmd, &ri);
+        return;
+    }
+    const VkRenderingAttachmentInfo* colour = ri.colorAttachmentCount ? ri.pColorAttachments : nullptr;
+    const VkRenderingAttachmentInfo* depth = ri.pDepthAttachment;
+    const VkRenderingAttachmentInfo* stencil = ri.pStencilAttachment ? ri.pStencilAttachment : depth;
+    std::uint32_t ops = 0;
+    if (colour) ops |= LoadBits(colour->loadOp) | StoreBits(colour->storeOp) << 2;
+    ops |= LoadBits(depth->loadOp) << 4 | StoreBits(depth->storeOp) << 6;
+    ops |= LoadBits(stencil->loadOp) << 8 | StoreBits(stencil->storeOp) << 10;
+    const VkRenderPass pass = RenderPass(colour != nullptr, ops);
+    const FramebufferKey key{colour ? colour->imageView : VK_NULL_HANDLE, depth->imageView, whole.width,
+                             whole.height};
+    VkFramebuffer& framebuffer = framebuffers_[key];
+    if (!framebuffer) {
+        const VkImageView views[2] = {colour ? colour->imageView : VK_NULL_HANDLE, depth->imageView};
+        VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fci.renderPass = CompatiblePass(colour != nullptr);
+        fci.attachmentCount = colour ? 2 : 1;
+        fci.pAttachments = colour ? views : views + 1;
+        fci.width = whole.width;
+        fci.height = whole.height;
+        fci.layers = 1;
+        vkCreateFramebuffer(g_.device, &fci, nullptr, &framebuffer);
+    }
+    VkClearValue clears[2] = {};
+    if (colour) clears[0] = colour->clearValue;
+    clears[colour ? 1 : 0].depthStencil = {depth->clearValue.depthStencil.depth,
+                                            stencil->clearValue.depthStencil.stencil};
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = pass;
+    rbi.framebuffer = framebuffer;
+    rbi.renderArea = ri.renderArea;
+    rbi.clearValueCount = colour ? 2 : 1;
+    rbi.pClearValues = clears;
+    vkCmdBeginRenderPass(cmd, &rbi, (ri.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)
+                                        ? VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS
+                                        : VK_SUBPASS_CONTENTS_INLINE);
 }
 
 VkDescriptorSet VulkanGsRenderer::DepthSampledSet(Image& image) {
@@ -1621,7 +1912,7 @@ void VulkanGsRenderer::DepthIn(VkCommandBuffer cmd, const SwizzleParams& params,
     ri.layerCount = 1;
     ri.pDepthAttachment = &z;
     ri.pStencilAttachment = &z;
-    vkCmdBeginRendering(cmd, &ri);
+    BeginRendering(cmd, ri, ri.renderArea.extent);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, depth_load_pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, depth_load_layout_, 0, 1, &swizzle_set_, 0,
                             nullptr);
@@ -1634,7 +1925,7 @@ void VulkanGsRenderer::DepthIn(VkCommandBuffer cmd, const SwizzleParams& params,
     const VkRect2D sc{{0, std::int32_t(y0)}, {std::min(params.cols, d.width) * k, y1 - std::min(y0, y1)}};
     vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdDraw(cmd, 3, 1, 0, 0);
-    vkCmdEndRendering(cmd);
+    EndRendering(cmd);
     g_.Mark(cmd, kProfSwizzle);
 }
 
@@ -1701,7 +1992,8 @@ void VulkanGsRenderer::MemoryWrite(std::uint32_t begin, std::uint32_t end, const
     void* mapped = Staging(size, &buffer, &offset);
     if (!mapped) return;
     std::memcpy(mapped, bytes, std::size_t(size));
-    g_.Record([&](VkCommandBuffer cmd) {
+    // (Local memory: read by decodes, swizzles and reloads, never by a draw.)
+    RecordBeside(VK_NULL_HANDLE, false, [&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         const VkBufferCopy copy{offset, VkDeviceSize(begin) * 256, size};
         vkCmdCopyBuffer(cmd, buffer, gsmem_, 1, &copy);
@@ -2035,8 +2327,11 @@ void VulkanGsRenderer::DropImages() {
 namespace {
 std::string g_pipeline_cache_dir;       // SetPipelineCacheDir
 std::vector<std::uint32_t> g_pipeline_hints;    // SetPipelineHints
+// WarmPipelines' progress (PipelineWarmProgress): asked, and made by the workers.
+std::atomic<std::size_t> g_warm_total{0}, g_warm_made{0};
 std::string CacheFile(const char* name) { return g_pipeline_cache_dir + "/" + name; }
 }  // namespace
+
 
 void VulkanGsRenderer::OpenPipelineCache() {
     // What a last run left (the driver checks it is its own, and ignores it
@@ -2064,8 +2359,26 @@ void VulkanGsRenderer::OpenPipelineCache() {
 void VulkanGsRenderer::WarmPipelines() {
     if (g_pipeline_cache_dir.empty()) return;
     async_pipelines_ = true;            // (a run that keeps a cache is a player's)
-    std::ifstream in(CacheFile("gpu_pipelines.txt"));
     std::string word;
+    if (g_vk_baked_states) {
+        // (The game's list is of dynamic pipelines: the last runs' alone.)
+        std::ifstream baked(CacheFile("gpu_pipelines_baked.txt"));
+        std::vector<std::uint64_t> ids;
+        while (baked && baked >> word) {
+            const std::uint64_t id = std::strtoull(word.c_str(), nullptr, 16);
+            if (!(id >> 32) || baked_pipelines_.count(id) || !pipelines_asked_.insert(id).second) continue;
+            known_baked_.insert(id);
+            ids.push_back(id);
+        }
+        if (ids.empty()) return;
+        warm_began_ = std::chrono::steady_clock::now();
+        warm_left_ = ids.size();
+        g_warm_made = 0;
+        g_warm_total = ids.size();
+        for (std::uint64_t id : ids) AskWorker(id, false);
+        return;
+    }
+    std::ifstream in(CacheFile("gpu_pipelines.txt"));
     std::vector<std::uint32_t> keys;
     while (in && in >> word) {
         const std::uint32_t key = std::uint32_t(std::strtoul(word.c_str(), nullptr, 16));
@@ -2080,31 +2393,45 @@ void VulkanGsRenderer::WarmPipelines() {
     if (keys.empty()) return;
     warm_began_ = std::chrono::steady_clock::now();
     warm_left_ = keys.size();
+    g_warm_made = 0;
+    g_warm_total = keys.size();
     for (std::uint32_t key : keys) AskWorker(key, false);
 }
 
 /* A pipeline for the worker to make: a player's draw first (`soon`), the
    start's list after. */
-void VulkanGsRenderer::AskWorker(std::uint32_t key, bool soon) {
-    if (!pipeline_worker_.joinable())
-        pipeline_worker_ = std::thread([this] {
-            std::unique_lock<std::mutex> hold(pipeline_lock_);
-            for (;;) {
-                pipeline_wake_.wait(hold, [this] { return pipeline_stop_ || !pipeline_queue_.empty(); });
-                if (pipeline_stop_) return;
-                const std::uint32_t next = pipeline_queue_.front();
-                pipeline_queue_.pop_front();
-                hold.unlock();
-                const VkPipeline made = MakePipeline(next);
-                hold.lock();
-                pipelines_made_.emplace_back(next, made);
-                pipelines_ready_.store(true, std::memory_order_release);
-            }
-        });
+void VulkanGsRenderer::AskWorker(std::uint64_t id, bool soon) {
+    // Several workers: a first start (no cache: a driver compiling each
+    // shader - a phone's tens of milliseconds and more) made in a fraction
+    // of the time, the processors otherwise idle while it waits.
+    if (pipeline_workers_.empty()) {
+        const unsigned processors = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned workers = std::clamp(processors / 2, 1u, 4u);
+        for (unsigned i = 0; i < workers; ++i)
+            pipeline_workers_.emplace_back([this] {
+                std::unique_lock<std::mutex> hold(pipeline_lock_);
+                for (;;) {
+                    pipeline_wake_.wait(hold, [this] { return pipeline_stop_ || !pipeline_queue_.empty(); });
+                    if (pipeline_stop_) return;
+                    const std::uint64_t next = pipeline_queue_.front();
+                    pipeline_queue_.pop_front();
+                    hold.unlock();
+                    // PS2HOST_PIPELINE_SLOW_MS: each made that much slower (a cold driver, to test).
+                    static const int slow_ms = std::getenv("PS2HOST_PIPELINE_SLOW_MS") ? std::atoi(std::getenv("PS2HOST_PIPELINE_SLOW_MS")) : 0;
+                    if (slow_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(slow_ms));
+                    const VkPipeline made = MakePipeline(
+                        std::uint32_t(next), next >> 32 ? std::uint32_t((next >> 32) - 1) : kDynamicStates);
+                    hold.lock();
+                    pipelines_made_.emplace_back(next, made);
+                    pipelines_ready_.store(true, std::memory_order_release);
+                    g_warm_made.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+    }
     {
         std::lock_guard<std::mutex> hold(pipeline_lock_);
-        if (soon) pipeline_queue_.push_front(key);
-        else pipeline_queue_.push_back(key);
+        if (soon) pipeline_queue_.push_front(id);
+        else pipeline_queue_.push_back(id);
     }
     pipeline_wake_.notify_one();
 }
@@ -2124,8 +2451,14 @@ void VulkanGsRenderer::SavePipelineCache() {
         std::snprintf(text, sizeof text, "%08X\n", unsigned(key));
         keys += text;
     }
+    std::string baked;
+    for (std::uint64_t id : known_baked_) {
+        char text[20];
+        std::snprintf(text, sizeof text, "%016llX\n", static_cast<unsigned long long>(id));
+        baked += text;
+    }
     cache_saving_ = true;
-    std::thread([this, device = g_.device, cache = cache_, keys = std::move(keys)] {
+    std::thread([this, device = g_.device, cache = cache_, keys = std::move(keys), baked = std::move(baked)] {
         std::size_t size = 0;
         std::vector<char> data;
         if (vkGetPipelineCacheData(device, cache, &size, nullptr) == VK_SUCCESS && size) {
@@ -2146,7 +2479,8 @@ void VulkanGsRenderer::SavePipelineCache() {
             std::rename((path + ".new").c_str(), path.c_str());
         };
         if (!data.empty()) write(CacheFile("gpu_pipeline_cache.bin"), data.data(), data.size());
-        write(CacheFile("gpu_pipelines.txt"), keys.data(), keys.size());
+        if (!keys.empty()) write(CacheFile("gpu_pipelines.txt"), keys.data(), keys.size());
+        if (!baked.empty()) write(CacheFile("gpu_pipelines_baked.txt"), baked.data(), baked.size());
         cache_saving_ = false;
     }).detach();
 }
@@ -2179,24 +2513,68 @@ VkPipeline VulkanGsRenderer::PipelineFor(std::uint32_t key) {
     return pipeline;
 }
 
+VkPipeline VulkanGsRenderer::BakedPipelineFor(std::uint32_t key, std::uint32_t baked) {
+    const std::uint64_t id = BakedId(key, baked);
+    if (id == last_baked_key_ && last_baked_) return last_baked_;
+    if (pipelines_ready_.load(std::memory_order_acquire)) TakeMadePipelines();
+    auto found = baked_pipelines_.find(id);
+    if (found != baked_pipelines_.end()) {
+        last_baked_key_ = id;
+        last_baked_ = found->second;
+        return found->second;
+    }
+    // A kind of draw's own asked of the worker, the whole shader's with the
+    // same states meanwhile (PipelineFor's way).
+    if (async_pipelines_ && (key >> kFeatureShift)) {
+        const VkPipeline stand_in = BakedPipelineFor(key & ((1u << kFeatureShift) - 1), baked);
+        if (stand_in) {
+            if (pipelines_asked_.insert(id).second) AskWorker(id, true);
+            return stand_in;
+        }
+    }
+    const auto began = std::chrono::steady_clock::now();
+    const VkPipeline pipeline = MakePipeline(key, baked);
+    if (!pipeline) return VK_NULL_HANDLE;
+    KeepBaked(id, pipeline);
+    static const bool log = std::getenv("PS2HOST_PIPELINE_LOG") != nullptr;
+    if (log)
+        std::fprintf(stderr, "[gpu] pipeline %08X, states %02X, made in %.1f ms\n", key, baked,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
+    last_baked_key_ = id;
+    last_baked_ = pipeline;
+    return pipeline;
+}
+
+void VulkanGsRenderer::KeepBaked(std::uint64_t id, VkPipeline pipeline) {
+    baked_pipelines_[id] = pipeline;
+    if (known_baked_.insert(id).second) cache_dirty_ = true;
+}
+
 /* The worker's pipelines into the renderer's (the GS thread's) own. */
 void VulkanGsRenderer::TakeMadePipelines() {
-    std::vector<std::pair<std::uint32_t, VkPipeline>> made;
+    std::vector<std::pair<std::uint64_t, VkPipeline>> made;
     {
         std::lock_guard<std::mutex> hold(pipeline_lock_);
         made.swap(pipelines_made_);
         pipelines_ready_.store(false, std::memory_order_relaxed);
     }
-    for (const auto& [key, pipeline] : made) {
-        pipelines_asked_.erase(key);
+    for (const auto& [id, pipeline] : made) {
+        pipelines_asked_.erase(id);
         if (warm_left_ && --warm_left_ == 0)
             std::fprintf(stderr, "[gpu] the pipelines known from the start (the last runs', the game's) made ready in %.0f ms\n",
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - warm_began_).count());
         if (!pipeline) continue;
+        if (id >> 32) {
+            if (baked_pipelines_.count(id)) vkDestroyPipeline(g_.device, pipeline, nullptr);
+            else KeepBaked(id, pipeline);
+            continue;
+        }
+        const std::uint32_t key = std::uint32_t(id);
         if (pipelines_.count(key)) vkDestroyPipeline(g_.device, pipeline, nullptr);
         else KeepPipeline(key, pipeline, -1.0);
     }
     last_pipeline_key_ = ~0u;           // (it may have been the whole shader's, standing in)
+    last_baked_key_ = ~0ull;
 }
 
 void VulkanGsRenderer::KeepPipeline(std::uint32_t key, VkPipeline pipeline, double ms) {
@@ -2214,7 +2592,7 @@ void VulkanGsRenderer::KeepPipeline(std::uint32_t key, VkPipeline pipeline, doub
 
 /* A pipeline for a key: blending and the write mask (PipelineKey), the
    shader's features (Features) as its specialisation. Any thread. */
-VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
+VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key, std::uint32_t baked) {
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                                  {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -2227,8 +2605,10 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     const VkSpecializationMapEntry feature_entry{0, 0, sizeof features};
     VkSpecializationInfo specialisation{1, &feature_entry, sizeof features, &features};
     stages[1].pSpecializationInfo = &specialisation;
-    const VkVertexInputBindingDescription bindings[2] = {{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX},
-                                                         {1, sizeof(VertexRange), VK_VERTEX_INPUT_RATE_VERTEX}};
+    VkVertexInputBindingDescription bindings[2] = {{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX},
+                                                   {1, sizeof(VertexRange), VK_VERTEX_INPUT_RATE_VERTEX}};
+    // (Baked: the ranges a vertex each, or one for all - stride 0.)
+    if (baked != kDynamicStates && !(baked & kBakedRanges)) bindings[1].stride = 0;
     VkVertexInputAttributeDescription attributes[6] = {
         {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(PackedVertex, x)},
         {1, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(PackedVertex, r)},
@@ -2264,6 +2644,23 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     // The destination alpha test: drawn only where the setup pass set stencil 1.
     VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depth.front = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_EQUAL, 1, 0, 1};
+    std::uint32_t dynamic_count = 11;
+    if (baked != kDynamicStates) {
+        // What the draw would set (ZTST NEVER, ALWAYS, GEQUAL, GREATER; the
+        // stencil as DrawPending sets it), and only the viewport and scissor
+        // left dynamic.
+        static const VkCompareOp kCompare[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS,
+                                                VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
+        depth.depthTestEnable = (baked & kBakedDepthTest) ? VK_TRUE : VK_FALSE;
+        depth.depthWriteEnable = (baked & kBakedDepthWrite) ? VK_TRUE : VK_FALSE;
+        depth.depthCompareOp = kCompare[(baked >> 2) & 3];
+        const std::uint32_t stencil = (baked >> 4) & 3;
+        depth.stencilTestEnable = stencil != 0 ? VK_TRUE : VK_FALSE;
+        if (stencil != 1)
+            depth.front = {VK_STENCIL_OP_KEEP, stencil >= 2 ? VK_STENCIL_OP_REPLACE : VK_STENCIL_OP_KEEP,
+                           VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0, stencil >= 2 ? 2u : 0u, stencil == 2 ? 2u : 0u};
+        dynamic_count = 2;
+    }
     depth.back = depth.front;
     VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
@@ -2272,7 +2669,7 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
                                        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
                                        VK_DYNAMIC_STATE_STENCIL_REFERENCE};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 11;
+    dynamic.dynamicStateCount = dynamic_count;
     dynamic.pDynamicStates = dynamic_states;
     const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -2281,7 +2678,8 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     rendering.depthAttachmentFormat = kDepthFormat;
     rendering.stencilAttachmentFormat = kDepthFormat;
     VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pci.pNext = &rendering;
+    pci.renderPass = CompatiblePass(true);
+    if (!pci.renderPass) pci.pNext = &rendering;
     pci.stageCount = 2;
     pci.pStages = stages;
     pci.pVertexInputState = &input;
@@ -2343,7 +2741,8 @@ bool VulkanGsRenderer::MakeDatePipeline() {
     rendering.depthAttachmentFormat = kDepthFormat;
     rendering.stencilAttachmentFormat = kDepthFormat;
     VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pci.pNext = &rendering;
+    pci.renderPass = CompatiblePass(false);
+    if (!pci.renderPass) pci.pNext = &rendering;
     pci.stageCount = 2;
     pci.pStages = stages;
     pci.pVertexInputState = &input;
@@ -2391,6 +2790,11 @@ void VulkanGsRenderer::WriteTextureSet(VkDescriptorSet set, VkSampler sampler, c
 
 void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& depth, std::uint32_t datm) {
     if (!SampledSet(target)) return;
+    if (g_vk_labels) {
+        char label[64];
+        std::snprintf(label, sizeof label, "DATE setup of %p", (void*)target.image);
+        VkLabelBegin(cmd, label);
+    }
     Transition(cmd, target, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     Transition(cmd, depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -2409,7 +2813,7 @@ void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& dept
     ri.layerCount = 1;
     ri.pDepthAttachment = &z;
     ri.pStencilAttachment = &stencil;
-    vkCmdBeginRendering(cmd, &ri);
+    BeginRendering(cmd, ri, ri.renderArea.extent);
     drawn_ = DrawState{};           // its own pipeline, sets, viewport and scissor
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, date_pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &target.sampled, 0, nullptr);
@@ -2422,7 +2826,8 @@ void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& dept
     vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset, sizeof params, &params);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     g_.Mark(cmd, kProfDate);
-    vkCmdEndRendering(cmd);
+    EndRendering(cmd);
+    VkLabelEnd(cmd);
 }
 
 VkDescriptorSet VulkanGsRenderer::SetFor(Texture& texture, int sampler) {
@@ -2602,6 +3007,25 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
     for (std::uint32_t n = 0; n < levels; ++n) height += std::max(1u, d.th >> n);
     Texture* texture = TextureImage(key, d.tw, height);
     if (!texture) return;
+    // A deferred pass's draws sampled it already: they keep its image (and
+    // their sets), retired once they have run; the new contents go into
+    // another - the pass left open, not ended for the decode.
+    if (pass_cmd_ && texture->image.image &&
+        std::find(pass_sampled_.begin(), pass_sampled_.end(), texture->image.image) != pass_sampled_.end()) {
+        const Texture old = *texture;
+        *texture = Texture{};
+        texture = TextureImage(key, d.tw, height);
+        if (!texture || !texture->image.image) {
+            if (texture) *texture = old;        // (no image to be had: the pass ends after all)
+            else textures_[key] = old;
+            texture = &textures_[key];
+        } else {
+            texture->replaced = old.replaced;
+            texture->last_used = old.last_used;
+            RetireTexture(old);
+            ++g_renamed;
+        }
+    }
     texture->replacement = 0;
     Image& t = texture->image;
     // Straight into the image where it can be (see decode_image_pipeline_):
@@ -2612,7 +3036,7 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
     const VkDescriptorSet direct =
         decode_image_pipeline_ && (t.usage & VK_IMAGE_USAGE_STORAGE_BIT) ? TextureStorageSet(t) : VK_NULL_HANDLE;
     if (direct) {
-        g_.Record([&](VkCommandBuffer cmd) {
+        RecordBeside(t.image, d.clut != nullptr, [&](VkCommandBuffer cmd) {
             MemoryBarrier(cmd);
             if (d.clut) {
                 vkCmdUpdateBuffer(cmd, clut_, 0, 1024, d.clut);
@@ -2641,7 +3065,7 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
         });
         return;
     }
-    g_.Record([&](VkCommandBuffer cmd) {
+    RecordBeside(t.image, d.clut != nullptr, [&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         if (d.clut) vkCmdUpdateBuffer(cmd, clut_, 0, 1024, d.clut);
         MemoryBarrier(cmd);
@@ -2754,6 +3178,10 @@ void VulkanGsRenderer::ReleaseTexture(std::uint64_t key) {
     Flush();
     Texture texture = found->second;
     textures_.erase(found);
+    RetireTexture(texture);
+}
+
+void VulkanGsRenderer::RetireTexture(Texture texture) {
     texture.replacement = 0;
     // Recorded draws may still sample it: it goes after they have run - into
     // the pool, or away.
@@ -3283,7 +3711,7 @@ void VulkanGsRenderer::Flush() {
     const bool source_only = !state_.blend || (state_.a == state_.b && state_.d == BlendColour::Source) ||
                              (state_.a == BlendColour::Source && state_.b == BlendColour::Zero &&
                               state_.c == BlendAlpha::Fix && state_.fix == 0x80 && state_.d == BlendColour::Zero);
-    const bool logic = g_.logic_op && PartlyMasked(kept) && source_only;
+    const bool logic = !g_masks_in_shader && PartlyMasked(kept) && source_only;
     std::vector<Pass> passes;
     if (!state_.alpha_test || state_.atst == 1) {
         passes = {{2, depth_write, mask}};
@@ -3320,6 +3748,12 @@ void VulkanGsRenderer::Flush() {
     params.scale = source ? source->scale : 1;
     params.blend_ops = std::uint32_t(state_.a) | std::uint32_t(state_.b) << 2 | std::uint32_t(state_.c) << 4 |
                        std::uint32_t(state_.d) << 6;
+    if (!state_.blend && shader_blend) {
+        // (Only for FBMSK, MaskedInShader: the source as it is - (Cs - 0) * 128 >> 7 + 0.)
+        params.blend_ops = std::uint32_t(BlendColour::Source) | std::uint32_t(BlendColour::Zero) << 2 |
+                           std::uint32_t(BlendAlpha::Fix) << 4 | std::uint32_t(BlendColour::Zero) << 6;
+        params.fix = 0x80;
+    }
     if (state_.textured && t->scale > 1) params.blend_ops |= (t->scale & 0xFFu) << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
     if (state_.tag & 1u) params.blend_ops |= 1u << 19;          // gs.frag: the paint's Fresnel term
@@ -3347,6 +3781,7 @@ void VulkanGsRenderer::Flush() {
             if (state_.date) DateSetup(cmd, *t, *depth, state_.datm);
             if (copy_first) {
                 ++g_feedback;
+                if (shader_blend && source != t) ++g_feedback_blend;
                 Transition(cmd, *t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                            VK_PIPELINE_STAGE_TRANSFER_BIT);
                 Transition(cmd, *feedback_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -3371,10 +3806,15 @@ void VulkanGsRenderer::Flush() {
                 g_.Mark(cmd, kProfFeedback);
                 Transition(cmd, *feedback_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-            } else if (source) {
+            }
+            // Another target read as the texture: a texture's layout - also
+            // when the copy above is the blend's in the shader, not this one
+            // (it was left a target's, read as it was being drawn as one:
+            // NVIDIA drew it right, the validation layer and a stricter
+            // driver not).
+            if (source && source != t)
                 Transition(cmd, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-            }
             if (!open_target_) {
             Transition(cmd, *t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
@@ -3400,14 +3840,29 @@ void VulkanGsRenderer::Flush() {
             ri.pDepthAttachment = &z;
             ri.pStencilAttachment = &z;
             ++g_passes;
-            vkCmdBeginRendering(cmd, &ri);
+            if (defer_passes_)
+                pass_cmd_ = g_.BeginSecondary(VK_FORMAT_R8G8B8A8_UNORM, kDepthFormat, CompatiblePass(true));
+            if (pass_cmd_) {
+                pass_colour_ = colour;
+                pass_z_ = z;
+                pass_area_ = ri.renderArea;
+                pass_x0_ = pass_y0_ = INT32_MAX;
+                pass_x1_ = pass_y1_ = INT32_MIN;
+                pass_drew_ = pass_depth_read_ = pass_depth_written_ = false;
+                pass_sampled_.clear();
+                drawn_ = DrawState{};           // (a secondary inherits no state)
+            } else {
+                BeginRendering(cmd, ri, ri.renderArea.extent);
+            }
             open_target_ = t;
             open_depth_ = depth;
             }
+            // The pass's draws into its own command buffer, when deferred.
+            if (pass_cmd_) cmd = pass_cmd_;
             // ZTST: NEVER, ALWAYS, GEQUAL, GREATER - the larger Z is nearer.
             static const VkCompareOp kCompare[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS,
                                                     VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
-            if (drawn_.recording != g_.recording_id()) drawn_ = DrawState{g_.recording_id()};
+            if (!pass_cmd_ && drawn_.recording != g_.recording_id()) drawn_ = DrawState{g_.recording_id()};
             DrawState& d = drawn_;
             // The stencil: the destination alpha test (bit 1, the setup
             // pass's), else - once a game tags paint to be marked (tag bit 3,
@@ -3418,8 +3873,9 @@ void VulkanGsRenderer::Flush() {
             const int stencil_test = state_.date ? 1 : paint_mask_ ? ((state_.tag & 1u) ? 2 : 3) : 0;
             const int depth_test = state_.depth ? 1 : 0;
             const int compare = int(state_.ztst & 3);
-            if (d.depth_test != depth_test) vkCmdSetDepthTestEnable(cmd, VkBool32(d.depth_test = depth_test));
-            if (d.stencil_test != stencil_test) {
+            const bool baked = g_vk_baked_states;   // (these in the pipeline, below)
+            if (!baked && d.depth_test != depth_test) vkCmdSetDepthTestEnable(cmd, VkBool32(d.depth_test = depth_test));
+            if (!baked && d.stencil_test != stencil_test) {
                 d.stencil_test = stencil_test;
                 vkCmdSetStencilTestEnable(cmd, VkBool32(stencil_test != 0));
                 const VkStencilFaceFlags both = VK_STENCIL_FACE_FRONT_AND_BACK;
@@ -3439,7 +3895,7 @@ void VulkanGsRenderer::Flush() {
                     vkCmdSetStencilReference(cmd, both, stencil_test == 2 ? 2 : 0);
                 }
             }
-            if (d.compare != compare) vkCmdSetDepthCompareOp(cmd, kCompare[d.compare = compare]);
+            if (!baked && d.compare != compare) vkCmdSetDepthCompareOp(cmd, kCompare[d.compare = compare]);
             if (d.sets[0] != set || d.sets[1] != clut_set_) {
                 d.sets[0] = set;
                 d.sets[1] = clut_set_;
@@ -3468,6 +3924,18 @@ void VulkanGsRenderer::Flush() {
                 d.scissor = sc;
                 vkCmdSetScissor(cmd, 0, 1, &sc);
             }
+            if (pass_cmd_ && sc.extent.width && sc.extent.height) {
+                pass_drew_ = true;
+                if (std::find(pass_sampled_.begin(), pass_sampled_.end(), bound->image) == pass_sampled_.end())
+                    pass_sampled_.push_back(bound->image);
+                pass_x0_ = std::min(pass_x0_, sc.offset.x);
+                pass_y0_ = std::min(pass_y0_, sc.offset.y);
+                pass_x1_ = std::max(pass_x1_, sc.offset.x + std::int32_t(sc.extent.width));
+                pass_y1_ = std::max(pass_y1_, sc.offset.y + std::int32_t(sc.extent.height));
+                // (ZTST ALWAYS - the GS's way of not testing - or NEVER reads no depth.)
+                pass_depth_read_ = pass_depth_read_ || (depth_test && compare >= 2) || stencil_test == 1;
+                pass_depth_written_ = pass_depth_written_ || stencil_test >= 2;
+            }
             const float size[2] = {float(t->width), float(t->height)};
             if (size[0] != d.size[0] || size[1] != d.size[1]) {
                 d.size[0] = size[0];
@@ -3485,7 +3953,8 @@ void VulkanGsRenderer::Flush() {
                     const VkBuffer buffers[2] = {vertex_buffer, range_buffer};
                     const VkDeviceSize offsets[2] = {0, 0};
                     const VkDeviceSize strides[2] = {sizeof(PackedVertex), 0};
-                    vkCmdBindVertexBuffers2(cmd, 0, 2, buffers, offsets, nullptr, strides);
+                    if (baked) vkCmdBindVertexBuffers(cmd, 0, 2, buffers, offsets);
+                    else vkCmdBindVertexBuffers2(cmd, 0, 2, buffers, offsets, nullptr, strides);
                 }
                 first = std::uint32_t(vertex_offset / sizeof(PackedVertex));
             } else {
@@ -3493,11 +3962,21 @@ void VulkanGsRenderer::Flush() {
                 const VkBuffer buffers[2] = {vertex_buffer, range_buffer};
                 const VkDeviceSize offsets[2] = {vertex_offset, range_offset};
                 const VkDeviceSize strides[2] = {sizeof(PackedVertex), sizeof(VertexRange)};
-                vkCmdBindVertexBuffers2(cmd, 0, 2, buffers, offsets, nullptr, strides);
+                if (baked) vkCmdBindVertexBuffers(cmd, 0, 2, buffers, offsets);
+                else vkCmdBindVertexBuffers2(cmd, 0, 2, buffers, offsets, nullptr, strides);
             }
             // PABE splits each pass again: blended where As >= 0x80 (the shader's
             // pabe 1), not blended below (pabe 2, the pipeline without blending).
             const bool split = state_.blend && state_.pabe;
+            char label[160] = "";
+            if (g_vk_labels) {
+                std::snprintf(label, sizeof label, "batch: FBP %X PSM %X into %p; texture %s %X; DATE %d, shader blend %d, copy %d",
+                              unsigned(state_.fbp), unsigned(state_.psm), (void*)t->image,
+                              !state_.textured ? "none" : state_.texture_target ? "a target" : "memory",
+                              unsigned(state_.texture_target ? state_.tex_fbp : 0), int(state_.date), int(shader_blend),
+                              int(copy_first));
+                VkLabelBegin(cmd, label);
+            }
             for (const Pass& pass : passes) {
                 for (std::uint32_t half = split ? 1 : 0; half <= (split ? 2u : 0u); ++half) {
                     std::uint32_t key = (PipelineKey(state_) & ~(0xFu << 9)) | ((~pass.write_mask & 0xFu) << 9);
@@ -3516,7 +3995,10 @@ void VulkanGsRenderer::Flush() {
                         static const bool whole = std::getenv("PS2HOST_GPU_UBERSHADER") != nullptr;
                         const std::uint32_t full_key =
                             whole ? op_key : op_key | ((~Features(params) & kFeatureBits) << kFeatureShift);
-                        const VkPipeline chosen = PipelineFor(full_key);
+                        const int depth_write = pass.depth_write && op != 1 ? 1 : 0;
+                        const VkPipeline chosen =
+                            baked ? BakedPipelineFor(full_key, Baked(depth_test, depth_write, compare, stencil_test, own_ranges))
+                                  : PipelineFor(full_key);
                         if (!chosen) {
                             if (complaints < 5) {
                                 ++complaints;
@@ -3528,18 +4010,23 @@ void VulkanGsRenderer::Flush() {
                             d.pipeline = chosen;
                             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, chosen);
                         }
-                        const int depth_write = pass.depth_write && op != 1 ? 1 : 0;
-                        if (d.depth_write != depth_write)
+                        if (depth_write) pass_depth_written_ = true;
+                        if (!baked && d.depth_write != depth_write)
                             vkCmdSetDepthWriteEnable(cmd, VkBool32(d.depth_write = depth_write));
                         params.keep = keep;
                         vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset,
                                            sizeof params, &params);
                         ++g_draws;
-                        vkCmdDraw(cmd, count, 1, first, 0);
+                        // PS2HOST_GPU_NO_DRAW: a measure only - everything but the
+                        // primitives' drawing recorded (a software device, as
+                        // SwiftShader, then times the CPU's side, not its own).
+                        static const bool no_draw = std::getenv("PS2HOST_GPU_NO_DRAW") != nullptr;
+                        if (!no_draw) vkCmdDraw(cmd, count, 1, first, 0);
                         g_.MarkDraw(cmd, tag);
                     }
                 }
             }
+            if (label[0]) VkLabelEnd(cmd);
         });
     }
     pending_.clear();
@@ -3680,16 +4167,18 @@ bool VulkanGsRenderer::ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uin
 }
 
 VulkanGsRenderer::~VulkanGsRenderer() {
-    if (pipeline_worker_.joinable()) {
+    if (!pipeline_workers_.empty()) {
         {
             std::lock_guard<std::mutex> hold(pipeline_lock_);
             pipeline_stop_ = true;
         }
-        pipeline_wake_.notify_one();
-        pipeline_worker_.join();
+        pipeline_wake_.notify_all();
+        for (std::thread& worker : pipeline_workers_) worker.join();
     }
-    for (const auto& [key, pipeline] : pipelines_made_)
-        if (pipeline) pipelines_.emplace(key, pipeline);
+    for (const auto& [id, pipeline] : pipelines_made_)
+        if (pipeline && (id >> 32 ? !baked_pipelines_.emplace(id, pipeline).second
+                                  : !pipelines_.emplace(std::uint32_t(id), pipeline).second))
+            vkDestroyPipeline(g_.device, pipeline, nullptr);
     while (cache_saving_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     g_.Submit();
     {
@@ -3718,7 +4207,10 @@ VulkanGsRenderer::~VulkanGsRenderer() {
             vkFreeMemory(g_.device, chunk.memory, nullptr);
         }
     for (auto& [key, pipeline] : pipelines_) vkDestroyPipeline(g_.device, pipeline, nullptr);
+    for (auto& [key, pipeline] : baked_pipelines_) vkDestroyPipeline(g_.device, pipeline, nullptr);
     if (date_pipeline_) vkDestroyPipeline(g_.device, date_pipeline_, nullptr);
+    for (auto& [key, framebuffer] : framebuffers_) vkDestroyFramebuffer(g_.device, framebuffer, nullptr);
+    for (auto& [key, pass] : render_passes_) vkDestroyRenderPass(g_.device, pass, nullptr);
     for (VkSampler s : samplers_)
         if (s) vkDestroySampler(g_.device, s, nullptr);
     if (pool_) vkDestroyDescriptorPool(g_.device, pool_, nullptr);
@@ -3732,6 +4224,17 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (shuffle_pipeline_) vkDestroyPipeline(g_.device, shuffle_pipeline_, nullptr);
     if (shuffle_layout_) vkDestroyPipelineLayout(g_.device, shuffle_layout_, nullptr);
     if (shuffle_) vkDestroyShaderModule(g_.device, shuffle_, nullptr);
+    // The swizzle and decode to and from images, the memory patch, depth out and back.
+    for (VkPipeline p : {swizzle_image_pipeline_, decode_image_pipeline_, patch_pipeline_, swizzle_depth_pipeline_,
+                         depth_load_pipeline_})
+        if (p) vkDestroyPipeline(g_.device, p, nullptr);
+    for (VkPipelineLayout l : {swizzle_image_layout_, patch_layout_, swizzle_depth_layout_, depth_load_layout_})
+        if (l) vkDestroyPipelineLayout(g_.device, l, nullptr);
+    for (VkShaderModule m : {swizzle_image_, decode_image_, patch_, swizzle_depth_, depth_load_vert_, depth_load_frag_})
+        if (m) vkDestroyShaderModule(g_.device, m, nullptr);
+    for (VkDescriptorSetLayout l : {image_set_layout_, depth_set_layout_})
+        if (l) vkDestroyDescriptorSetLayout(g_.device, l, nullptr);
+    if (storage_pool_) vkDestroyDescriptorPool(g_.device, storage_pool_, nullptr);
     for (auto& format : swizzle_image_specialised_)
         for (auto& direction : format)
             for (VkPipeline pipeline : direction)
@@ -3796,14 +4299,16 @@ std::string GpuProfileReport() {
 }
 
 std::string RendererCounters() {
-    static std::uint64_t last[6] = {};
-    const std::uint64_t now[6] = {g_barriers, g_transitions, g_dispatches, g_draws, g_passes, g_feedback};
-    char text[200];
-    std::snprintf(text, sizeof text, "%llu barriers, %llu transitions, %llu dispatches, %llu draws, %llu passes, %llu feedback copies",
+    static std::uint64_t last[7] = {};
+    const std::uint64_t now[7] = {g_barriers, g_transitions, g_dispatches, g_draws, g_passes, g_feedback, g_feedback_blend};
+    char text[240];
+    std::snprintf(text, sizeof text, "%llu barriers, %llu transitions, %llu dispatches, %llu draws, %llu passes, "
+                  "%llu feedback copies (%llu for blending alone)",
                   (unsigned long long)(now[0] - last[0]), (unsigned long long)(now[1] - last[1]),
                   (unsigned long long)(now[2] - last[2]), (unsigned long long)(now[3] - last[3]),
-                  (unsigned long long)(now[4] - last[4]), (unsigned long long)(now[5] - last[5]));
-    for (int i = 0; i < 6; ++i) last[i] = now[i];
+                  (unsigned long long)(now[4] - last[4]), (unsigned long long)(now[5] - last[5]),
+                  (unsigned long long)(now[6] - last[6]));
+    for (int i = 0; i < 7; ++i) last[i] = now[i];
     static std::uint64_t last_ends[kEndWhys] = {};
     char ends[160];
     std::snprintf(ends, sizeof ends, "; passes ended by: alpha test %llu, own copy %llu, a source %llu, target %llu, "
@@ -3812,7 +4317,14 @@ std::string RendererCounters() {
                   (unsigned long long)(g_pass_ends[2] - last_ends[2]), (unsigned long long)(g_pass_ends[3] - last_ends[3]),
                   (unsigned long long)(g_pass_ends[4] - last_ends[4]), (unsigned long long)(g_pass_ends[5] - last_ends[5]));
     for (int i = 0; i < kEndWhys; ++i) last_ends[i] = g_pass_ends[i];
-    return std::string(text) + ends;
+    char deferred[256] = "";
+    if (g_area_whole)
+        std::snprintf(deferred, sizeof deferred, "; deferred passes: %.0f%% of their area drawn, depth not stored %llu, "
+                      "not loaded %llu, work beside them %llu, textures renamed %llu (in all)",
+                      100.0 * double(g_area_used) / double(g_area_whole),
+                      (unsigned long long)g_depth_unstored, (unsigned long long)g_depth_unloaded,
+                      (unsigned long long)g_beside, (unsigned long long)g_renamed);
+    return std::string(text) + ends + deferred;
 }
 
 std::string SubmitStats() {
@@ -3832,7 +4344,17 @@ std::string SubmitStats() {
 void SetPipelineCacheDir(const std::string& dir) { g_pipeline_cache_dir = dir; }
 void SetPipelineHints(const std::uint32_t* keys, std::size_t count) { g_pipeline_hints.assign(keys, keys + count); }
 
+std::string PipelineCacheDir() { return g_pipeline_cache_dir; }
+
+bool PipelineWarmProgress(std::size_t* made, std::size_t* total) {
+    const std::size_t all = g_warm_total.load(), done = std::min(all, g_warm_made.load());
+    if (made) *made = done;
+    if (total) *total = all;
+    return done < all;
+}
+
 std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error) {
+    if (gpu.api() == Gpu::Api::kD3D11) return CreateD3D11GsRenderer(gpu, error);
     auto renderer = std::make_unique<VulkanGsRenderer>(static_cast<VulkanGpu&>(gpu));
     if (!renderer->Init(error)) return nullptr;
     return renderer;

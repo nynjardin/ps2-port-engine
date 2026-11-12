@@ -41,6 +41,78 @@ inline std::mutex g_draw_ns_lock;
 inline std::unordered_map<std::uint32_t, std::uint64_t> g_draw_ns;
 struct WaitReason { const char* why; std::uint64_t count; double seconds; };
 inline WaitReason g_waits[16] = {};
+/* The device takes VK_ATTACHMENT_LOAD_OP_NONE (VK_EXT/KHR_load_store_op_none,
+   enabled by the Display where offered): an attachment a pass never reads. */
+inline bool g_load_op_none = false;
+
+/* Which Vulkan the device draws with (vk_device.cpp): 1.3; 1.2 with
+   VK_KHR_dynamic_rendering; 1.1 or 1.2 with render passes (the renderer's
+   BeginPass). PS2HOST_VK_LEGACY=1|2 takes the second or third on a 1.3 GPU. */
+enum VkPath { kVk13, kVk12Dynamic, kVk12RenderPass };
+inline VkPath g_vk_path = kVk13;
+/* Without VK_EXT_extended_dynamic_state (older phones' drivers): depth's test,
+   write and comparison, the stencil's and the ranges' stride made into the
+   GS draws' pipelines rather than set per batch (gs_renderer.cpp's
+   BakedPipelineFor). PS2HOST_VK_BAKED=1 takes it on any device. */
+inline bool g_vk_baked_states = false;
+/* VkImageFormatListCreateInfo may be chained (1.2, or VK_KHR_image_format_list
+   enabled: VkDeviceSetup::Fill). */
+inline bool g_image_format_list = true;
+/* PS2HOST_VK_LABELS=1: VK_EXT_debug_utils on the instance (VkDebugExtensions
+   adds it, VkDebugStart takes the validation layer's messages and prints
+   them with the labels around them) - the renderer's batches each a labelled
+   region (what they draw into and with), for the layer's messages and for
+   RenderDoc's captures. Off, it costs a test a batch. */
+inline bool g_vk_labels = false;
+void VkDebugExtensions(std::vector<const char*>* extensions);
+void VkDebugStart(VkInstance instance);
+inline void VkLabelBegin(VkCommandBuffer cmd, const char* text) {
+    if (!g_vk_labels) return;
+    VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+    label.pLabelName = text;
+    vkCmdBeginDebugUtilsLabelEXT(cmd, &label);
+}
+inline void VkLabelEnd(VkCommandBuffer cmd) {
+    if (g_vk_labels) vkCmdEndDebugUtilsLabelEXT(cmd);
+}
+/* VK_ATTACHMENT_STORE_OP_NONE can be used (1.3, dynamic rendering, or the
+   load_store_op_none extensions). */
+inline bool g_store_op_none = true;
+const char* VkPathName(VkPath path, bool baked = false);
+int VkLegacyForced();                       // PS2HOST_VK_LEGACY: 0, 1 or 2
+std::uint32_t VkInstanceVersion();          // 1.2 when the legacy path is forced, else 1.3
+int VkDeviceScore(const VkPhysicalDeviceProperties& p);      // PS2HOST_GPU's, then a discrete GPU
+/* Whether `gpu` can draw the GS, and on which path (`baked`: without extended
+   dynamic state); why not, when not. */
+bool VkDevicePath(VkPhysicalDevice gpu, VkPath* path, bool* baked, std::string* why);
+/* What a device on a path is made with: its features' chain (features, for
+   VkDeviceCreateInfo::pNext) and its extensions, to which a caller adds its
+   own. Not to be copied (the chain points into it). */
+struct VkDeviceSetup {
+    VkDeviceSetup() = default;
+    VkDeviceSetup(const VkDeviceSetup&) = delete;
+    VkDeviceSetup& operator=(const VkDeviceSetup&) = delete;
+    void Fill(VkPhysicalDevice gpu, VkPath path, bool baked);
+    VkPhysicalDeviceFeatures supported{};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic_rendering{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dynamic_state{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+    std::vector<const char*> extensions;
+    const char* load_none = nullptr;        // a load_store_op_none extension, if offered
+};
+/* SetPipelineCacheDir's directory ("" for none: a scripted run's). */
+std::string PipelineCacheDir();
+
+/* The GS renderer on a D3D11Gpu (d3d11_renderer.cpp). */
+std::unique_ptr<GsRenderer> CreateD3D11GsRenderer(Gpu& gpu, std::string* error);
+
+/* After the device is made: the path taken, and on 1.2 the core names the
+   renderer calls pointed at the extensions' entries. */
+void VkUseLegacyFunctions(VkPath path, bool baked);
+
 inline void CountWait(const char* why, double seconds) {
     for (WaitReason& w : g_waits) {
         if (!w.why) w.why = why;
@@ -100,6 +172,39 @@ public:
         Mark(c, kProfDraw);
         tags_[current_].back() = tag;
     }
+    /* A secondary command buffer of this slot's, begun to continue a
+       rendering pass into an RGBA8 colour and the GS's depth-stencil (the
+       renderer's deferred passes): free again once the slot's primary is.
+       With `pass` (a compatible render pass: Vulkan 1.2 without dynamic
+       rendering), its subpass is what it continues. */
+    VkCommandBuffer BeginSecondary(VkFormat colour, VkFormat depth, VkRenderPass pass = VK_NULL_HANDLE) {
+        std::vector<VkCommandBuffer>& list = secondaries_[current_];
+        if (secondary_used_[current_] == list.size()) {
+            VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            cai.commandPool = pool;
+            cai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+            cai.commandBufferCount = 1;
+            VkCommandBuffer made = VK_NULL_HANDLE;
+            if (vkAllocateCommandBuffers(device, &cai, &made) != VK_SUCCESS) return VK_NULL_HANDLE;
+            list.push_back(made);
+        }
+        VkCommandBuffer c = list[secondary_used_[current_]++];
+        vkResetCommandBuffer(c, 0);
+        VkCommandBufferInheritanceRenderingInfo rendering{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO};
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachmentFormats = &colour;
+        rendering.depthAttachmentFormat = depth;
+        rendering.stencilAttachmentFormat = depth;
+        rendering.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkCommandBufferInheritanceInfo inherit{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+        if (pass) inherit.renderPass = pass;
+        else inherit.pNext = &rendering;
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+        begin.pInheritanceInfo = &inherit;
+        vkBeginCommandBuffer(c, &begin);
+        return c;
+    }
     /* Counts command buffers begun: what was set in one is not in the next. */
     std::uint64_t recording_id() const { return recordings_; }
     static constexpr int kSlots = 3;
@@ -131,6 +236,8 @@ private:
     std::string describe_;
     bool open_ = false;
     std::uint64_t recordings_ = 0;
+    std::vector<VkCommandBuffer> secondaries_[kSlots];     // BeginSecondary's
+    std::size_t secondary_used_[kSlots] = {};
     // Two timestamps a slot: as its command buffer starts and as it ends.
     VkQueryPool timestamps_ = VK_NULL_HANDLE;
     double timestamp_ns_ = 0;               // a tick, in nanoseconds
@@ -158,6 +265,7 @@ void VulkanGpu::RecordInPass(F&& record) {
         vkBeginCommandBuffer(cmd, &begin);
         open_ = true;
         ++recordings_;
+        secondary_used_[current_] = 0;
         if (timestamps_) {
             vkCmdResetQueryPool(cmd, timestamps_, 2 * std::uint32_t(current_), 2);
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps_, 2 * std::uint32_t(current_));

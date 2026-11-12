@@ -38,14 +38,21 @@ void SetGpuWaitObserver(GpuWaitObserver observer);
    the host's profiler sampling it (--sample-renderer). */
 void SetRendererThreadStart(void (*start)());
 
-/* A Vulkan instance and device with one graphics queue (Vulkan 1.3: dynamic
-   rendering). Opaque; created headless. */
+/* A GPU device the GS renderer draws with: a Vulkan instance and device with
+   one graphics queue (Vulkan 1.3, or 1.2 with its extensions), or a Direct3D
+   11 device (a D3D11 display's). Opaque; CreateGpu makes a Vulkan one,
+   headless. */
 class Gpu {
 public:
+    enum class Api { kVulkan, kD3D11 };
     virtual ~Gpu() = default;
     virtual std::string Describe() const = 0;
+    virtual Api api() const { return Api::kVulkan; }
 };
 std::unique_ptr<Gpu> CreateGpu(std::string* error);
+/* A Direct3D 11 device, headless (Windows; the renderer's tests): null, with
+   `error`, where there is none. */
+std::unique_ptr<Gpu> CreateD3D11Gpu(std::string* error);
 
 /* A vertex as the GS has it after XYOFFSET: position in pixels (the GS samples
    at whole pixel coordinates), colour 0-255, and the texture coordinate as
@@ -398,6 +405,9 @@ void SetPipelineCacheDir(const std::string& dir);
    are - a player's first run then makes none in the middle of a race. Keys
    of an older engine are only made in vain. Set before CreateGsRenderer. */
 void SetPipelineHints(const std::uint32_t* keys, std::size_t count);
+/* The start's pipelines (the last runs', the hints) being made: true while
+   some are still to come, with how many are made of how many. */
+bool PipelineWarmProgress(std::size_t* made, std::size_t* total);
 /* `inner` on a thread of its own (threaded_renderer.cpp): what only hands
    work over is queued and made there in order; what answers or reads waits
    for the queue to empty first. One caller thread. */

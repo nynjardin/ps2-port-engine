@@ -72,16 +72,23 @@ rewriting published history is their decision.
    makes from their disc (`build/port/icon.ico`) is for their own build only.
 4. **Regressions** pass (skill `ps2-port`) and the benchmark has no new late
    frames.
-5. **Package**: `python games/<name>/port/tools/package.py` (the game's own
-   until a second game releases: then copy Burnout 3's
-   (burnout3-pc), and the second release moves the common part into
-   `engine/tools/`) writes
+5. **Package**: `python engine/tools/package.py --game games/<name>` (the
+   game's own bits from game.json: `title`, `version`, and `release` - the
+   zip's name and extra player files such as a texture pack folder's README)
+   writes
    `build/release/<Name>-PC-<version>-windows-x64.zip` - the executable, the
    player's README (`port/release/README.txt`: what is needed, getting started,
    controls, settings, the files beside the executable, known issues, the
    notice) and the third-party licences. It refuses a build with the disc-made
    logo, one that imports the Visual C++ runtime, or one that names a folder of
    the build machine. Don't bypass a refusal: fix its cause.
+   **Linux** (when the release has one): `python engine/tools/linux.py --game
+   games/<name> build`, `... test --runs car_select` (the software GS's
+   pictures as recorded on Windows), then `package.py --game games/<name>
+   --platform linux`: `build/release/<Name>-PC-<version>-linux-x64.tar.gz`,
+   refused when it needs the C++ runtime installed or names a folder of the
+   machine or the build container. It needs glibc 2.35+ (Ubuntu 22.04, Debian
+   12, SteamOS); say so in the README.
 6. **Test it as a player would**: unzip into an empty folder, start it with no
    arguments (a `pc_settings.ini` with `disc=` beside it, for an unattended
    check: the picker otherwise waits for a person), check the log (version,

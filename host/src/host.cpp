@@ -1,8 +1,9 @@
 #include "ps2host/host.h"
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "ps2host/platform.h"
+#ifndef _WIN32
+#include <time.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +24,7 @@
 
 #include "ps2host/disc.h"
 #include "ps2host/gs.h"
+#include "ps2host/gs_blend.h"
 #include "ps2host/iop_vm.h"
 #include "ps2host/vif.h"
 #include "ps2host/vu.h"
@@ -50,10 +52,28 @@ namespace ps2host {
    PS2HOST_REPLAY_SAMPLE=1 sampled too (the sampler's report after). */
 /* The calling thread's CPU time (user and kernel), in milliseconds. */
 double ThreadCpuMs() {
+#ifdef _WIN32
     FILETIME created, exited, kernel, user;
     if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
     auto ms = [](const FILETIME& t) { return double(u64(t.dwHighDateTime) << 32 | t.dwLowDateTime) / 10000.0; };
     return ms(kernel) + ms(user);
+#else
+    timespec t{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t) != 0) return 0;
+    return double(t.tv_sec) * 1000.0 + double(t.tv_nsec) / 1e6;
+#endif
+}
+
+/* The calling thread's cycles (Windows: exact, where its CPU time moves in
+   15.6 ms ticks); elsewhere its CPU time in nanoseconds. */
+static u64 ThreadCycles() {
+#ifdef _WIN32
+    ULONG64 cycles = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &cycles);
+    return cycles;
+#else
+    return u64(ThreadCpuMs() * 1e6);
+#endif
 }
 
 int GsReplay(const std::string& file, const std::string& out) {
@@ -75,6 +95,84 @@ int GsReplay(const std::string& file, const std::string& out) {
         return 65;
     }
     std::filesystem::create_directories(out);
+    // PS2HOST_REPLAY_BLEND=t (0.5 if empty): before each picture after the
+    // first, one made `t` of the way to it from the one before, from their
+    // GS input (gs_blend.h) - the pictures between a game's own, as a high
+    // frame rate on a weak machine would have them.
+    if (const char* blend = std::getenv("PS2HOST_REPLAY_BLEND")) {
+        const float t = *blend ? float(std::atof(blend)) : 0.5f;
+        std::vector<GsPicture> pictures(1);
+        std::size_t at = 5 + kMemory;
+        while (at < data.size()) {
+            const char kind = char(data[at++]);
+            GsPicture& p = pictures.back();
+            if (kind == 'R' || kind == 'P') {
+                GsPicture::Entry e{kind, 0, 0, 0, 0, 0};
+                std::memcpy(&e.address, data.data() + at, 4);
+                std::memcpy(&e.value, data.data() + at + 4, 8);
+                p.entries.push_back(e);
+                at += 12;
+            } else if (kind == 'W') {
+                const u8 path = data[at];
+                u32 bytes;
+                std::memcpy(&bytes, data.data() + at + 1, 4);
+                std::vector<u32>& words = p.paths[path - 1];
+                p.entries.push_back({'W', path, 0, 0, u32(words.size()), bytes / 4});
+                words.resize(words.size() + bytes / 4);
+                std::memcpy(words.data() + words.size() - bytes / 4, data.data() + at + 5, bytes);
+                at += 5 + bytes;
+            } else if (kind == 'V') {
+                pictures.emplace_back();
+            } else {
+                break;
+            }
+        }
+        if (pictures.back().entries.empty()) pictures.pop_back();
+        std::vector<unsigned char> rebuilt(data.begin(), data.begin() + 5 + kMemory);
+        auto put = [&rebuilt](const GsPicture& p) {
+            for (const GsPicture::Entry& e : p.entries) {
+                rebuilt.push_back(u8(e.kind));
+                if (e.kind == 'W') {
+                    rebuilt.push_back(e.path);
+                    const u32 bytes = e.count * 4;
+                    const u8* b = reinterpret_cast<const u8*>(&bytes);
+                    rebuilt.insert(rebuilt.end(), b, b + 4);
+                    const u8* w = reinterpret_cast<const u8*>(p.paths[e.path - 1].data() + e.first);
+                    rebuilt.insert(rebuilt.end(), w, w + bytes);
+                } else {
+                    const u8* a = reinterpret_cast<const u8*>(&e.address);
+                    const u8* v = reinterpret_cast<const u8*>(&e.value);
+                    rebuilt.insert(rebuilt.end(), a, a + 4);
+                    rebuilt.insert(rebuilt.end(), v, v + 8);
+                }
+            }
+            rebuilt.push_back('V');
+        };
+        put(pictures[0]);
+        // The screen: XYOFFSET_1 as the replay starts (its 640x448, 64 pixels round).
+        GsBlendOptions options;
+        for (const GsPicture::Entry& e : pictures[0].entries)
+            if (e.kind == 'R' && e.address == 0x18) {
+                const u32 x = u32(e.value & 0xFFFF), y = u32((e.value >> 32) & 0xFFFF);
+                options.window[0] = x > 64 * 16 ? x - 64 * 16 : 0;
+                options.window[1] = y > 64 * 16 ? y - 64 * 16 : 0;
+                options.window[2] = x + (640 + 64) * 16;
+                options.window[3] = y + (448 + 64) * 16;
+            }
+        for (std::size_t k = 1; k < pictures.size(); ++k) {
+            GsPicture between;
+            const auto began = std::chrono::steady_clock::now();
+            const GsBlendStats s = BlendGsPictures(pictures[k - 1], pictures[k], t, between, options);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+            std::fprintf(stderr, "gs-replay: picture %zu made between: %u packets, %u matched (%u jumped), %u of %u vertices "
+                                 "blended (%u still, %u jumped; %u packets carried, %u loose, %u added, %u vertices snapped), %.2f ms (copy %.2f, align %.2f, blend %.2f: packets %.2f, snap %.2f, carry %.2f, add %.2f)\n",
+                         k, s.packets, s.matched, s.jumped, s.blended, s.vertices, s.still, s.jumped_vertices, s.carried, s.loose, s.added, s.snapped, ms,
+                         s.ms_copy, s.ms_align, s.ms_blend, s.ms_packets, s.ms_snap, s.ms_carry, s.ms_add);
+            put(between);
+            put(pictures[k]);
+        }
+        data.swap(rebuilt);
+    }
     gs::Gs& g = gs::TheGs();
     std::memcpy(g.memory.data(), data.data() + 5, kMemory);
     const bool gpu = std::getenv("PS2HOST_REPLAY_GPU") != nullptr;
@@ -116,6 +214,9 @@ int GsReplay(const std::string& file, const std::string& out) {
     int pass = 0;
     std::chrono::steady_clock::time_point started;
     double cpu_started = 0, renderer_started = 0;
+    std::vector<u64> pass_cycles;       // each timed pass's, this thread's (the least: the work without the waits' noise)
+    u64 cycles_at = 0;
+    u64 renderer_cycles = 0;            // the renderer's thread's over the timed passes (it lags them: a total)
     for (;;) {
     while (at < data.size()) {
         const char kind = char(data[at++]);
@@ -190,7 +291,11 @@ int GsReplay(const std::string& file, const std::string& out) {
         started = std::chrono::steady_clock::now();
         cpu_started = ThreadCpuMs();
         renderer_started = RendererThreadCpuMs();
+        renderer_cycles = RendererThreadCycles();
+    } else {
+        pass_cycles.push_back(ThreadCycles() - cycles_at);
     }
+    cycles_at = ThreadCycles();
     if (pass++ >= repeat) break;
     timing = true;
     at = stream;
@@ -207,6 +312,12 @@ int GsReplay(const std::string& file, const std::string& out) {
         std::fprintf(stderr, "gs-replay: %d passes, %.2f ms a pass (%d pictures each), this thread's CPU %.2f ms a pass, the renderer's %.2f\n",
                      repeat, ms / repeat, pictures, (ThreadCpuMs() - cpu_started) / repeat,
                      (RendererThreadCpuMs() - renderer_started) / repeat);
+        if (!pass_cycles.empty()) {
+            std::sort(pass_cycles.begin(), pass_cycles.end());
+            std::fprintf(stderr, "gs-replay: this thread's cycles a pass: least %.2f M, median %.2f M; the renderer's %.2f M\n",
+                         double(pass_cycles.front()) / 1e6, double(pass_cycles[pass_cycles.size() / 2]) / 1e6,
+                         double(RendererThreadCycles() - renderer_cycles) / 1e6 / double(repeat));
+        }
         if (std::getenv("PS2HOST_REPLAY_SAMPLE"))
             std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
     }
@@ -395,6 +506,8 @@ void Override(u32 address, GuestFunction function, const char* name) {
     for (CachedCall& line : g_call_cache) line = CachedCall{};
 }
 
+bool Overridden(u32 address) { return g_overrides.count(address) != 0; }
+
 void OverrideInOverlay(const char* overlay, u32 address, GuestFunction function, const char* name) {
     g_overlay_overrides[{overlay, address}] = FunctionEntry{address, function, name, 0};
     for (CachedCall& line : g_call_cache) line = CachedCall{};
@@ -534,6 +647,7 @@ u32 LoadElf(const std::string& path, std::vector<u8> data) {
             g_image_end = vaddr + filesz;
         }
     }
+    ApplySdkPatterns(g_image_start, g_image_end);
     return entry;
 }
 
@@ -725,9 +839,13 @@ int Run(const Options& options) {
         if (!options.memcard.empty()) {
             where = std::filesystem::absolute(options.memcard).parent_path();
         } else {
+#ifdef _WIN32
             wchar_t exe[MAX_PATH] = {};
             GetModuleFileNameW(nullptr, exe, MAX_PATH);
             where = std::filesystem::path(exe).parent_path();
+#else
+            where = std::filesystem::current_path();
+#endif
         }
         LoadSettings((where / "pc_settings.ini").string());
     }
@@ -821,8 +939,10 @@ int Run(const Options& options) {
         outcome = std::string("stopped: ") + reason + " at " + Hex(abort.address);
         if (abort.reason == 2 && watchdog.fired && abort.address == 0)
             outcome = "stopped: the time limit, between threads (no thread was in a loop)";
-        if (abort.reason == 2 && UntilFrameReached())
+        if (abort.reason == 2 && UntilFrameReached()) {
             outcome = "stopped: frame " + std::to_string(options.until_frame) + " reached (--until-frame)";
+            code = 0;           // (the end asked for: no error - Android's message box not shown)
+        }
     }
     // The GS takes what it was sent before the report reads it.
     try {
@@ -841,6 +961,7 @@ int Main(int argc, char** argv) {
     // machine with that many, to measure a low-end one on a big one. Or a
     // mask (0x5: logical cores 0 and 2 - two physical cores where the first
     // ones are hyperthreaded pairs).
+#ifdef _WIN32
     if (const char* cores = std::getenv("PS2HOST_CORES")) {
         DWORD_PTR mask = 0;
         if (cores[0] == '0' && (cores[1] == 'x' || cores[1] == 'X')) {
@@ -852,6 +973,7 @@ int Main(int argc, char** argv) {
         if (mask && SetProcessAffinityMask(GetCurrentProcess(), mask))
             std::fprintf(stderr, "[host] held to cores 0x%llX (PS2HOST_CORES)\n", (unsigned long long)mask);
     }
+#endif
     Options options;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -896,6 +1018,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--vu-fast") options.vu_fast = true;
         else if (arg == "--vu-exact") options.vu_exact = true;
         else if (arg == "--memcard" && i + 1 < argc) options.memcard = argv[++i];
+        else if (arg == "--no-memcard") options.memcard.clear();     // (a test on Android: no card, as on a PC)
         else if (arg == "--setting" && i + 1 < argc) options.settings.push_back(argv[++i]);
         else if (arg == "--setting-at" && i + 1 < argc) {
             // --setting-at KEY=VALUE@FRAME: changed mid-run (settings.h).

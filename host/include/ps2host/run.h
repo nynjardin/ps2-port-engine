@@ -160,6 +160,13 @@ std::atomic<bool>& StopRequested();
 
 /* SDK library routines the host implements, applied by name (sdk.cpp). */
 void ApplySdkOverrides(const FunctionEntry* table, std::size_t count);
+/* ...and those found by their instructions in the executable (its bytes,
+   loaded at start..end): applied as it is loaded, where the game's port has
+   no override of its own. */
+void ApplySdkPatterns(u32 start, u32 end);
+/* Whether an override (the host's or the game's) replaces the function at
+   `address`. */
+bool Overridden(u32 address);
 
 /* The EE kernel: lifted::Syscall's implementation (kernel.cpp). */
 void KernelSyscall(lifted::Context& c);
@@ -304,6 +311,9 @@ u64 LastVblankNs();
    processor, not to park it on an efficiency core) and to run it above
    normal priority. */
 void FastThread();
+/* The calling thread's priority: Windows' levels, Linux's nice values. */
+enum class HostPriority : u8 { kBelowNormal, kAboveNormal, kHighest, kTimeCritical };
+void SetHostPriority(HostPriority priority);
 bool Vif1Async();
 bool OnVif1Worker();
 bool Vif1Busy();
@@ -364,6 +374,9 @@ void PresentFrame();
 /* The window's events alone (PresentFrame without the picture, which the GS
    thread presents): false once it has been closed. */
 bool PumpWindow();
+/* The GPU's start pipelines made before the game runs, behind a loading
+   screen when that takes a while (a first start on a device). */
+void WaitForGpuPipelines();
 /* Fullscreen on or off (saved as the "fullscreen" setting, settings.h, which
    the window opens with); and whether it is. */
 void SetWindowFullscreen(bool on);
@@ -457,6 +470,28 @@ struct PortOption {
 void AddPortOptions(const std::vector<PortOption>& options);
 /* A port's EXIT GAME: the run ends as when the window is closed. */
 void QuitGame();
+/* The platform's (platform.cpp), for a port's settings - the rows that mean
+   something there: a phone (Android: always full screen, synced, its touch
+   controls), a keyboard attached (a PC's always), the touch controls shown
+   (the activity's toggle button does the same; false without them). */
+bool OnPhone();
+bool KeyboardPresent();
+bool TouchControlsShown();
+void SetTouchControls(bool shown);
+/* A phone's tilt, held as a wheel: degrees turned clockwise from level in
+   the screen's plane (its right side down: positive), whatever it leans back.
+   False with no reading in the last half second (no phone, no sensor, the
+   app in the background). */
+bool Tilt(float* degrees);
+/* A phone's heavy threads (platform.cpp; timeline::NameThread notes each by
+   its name): on the big cores, and the busiest one's work each frame told
+   to the system (HeavyThreadsFrame, once a frame) to clock for it. Nothing
+   elsewhere. PS2HOST_PIN=0, PS2HOST_ADPF=0: either off. */
+void NoteHeavyThread(const char* name);
+void HeavyThreadsFrame();
+/* "CPU EE 80%  GS 61%  VU1 93%  RENDER 40%": each heavy thread's share of a
+   core since the last call (the overlay's FPS + CPU); "" off a phone. */
+std::string HeavyThreadLoad();
 /* A port's look at the 2D on its way to the GS (VIF1 DIRECT, PATH2): each
    block of words, `from` the guest address of the first, before the GS takes
    it. A copy - the guest's packets stay as the game wrote them - on the EE

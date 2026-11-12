@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -19,6 +20,7 @@
 #include "ps2host/dma.h"
 #include "ps2host/gs.h"
 #include "ps2host/bindings.h"
+#include "ps2host/custom_songs.h"
 #include "ps2host/host.h"
 #include "ps2host/hud.h"
 #include "ps2host/libnet.h"
@@ -415,14 +417,68 @@ void VifUnpacksInRunsAsWordByWord() {
     unpack(1, 1, 0x8, 5, 0x200, 3);         // V3-32
     unpack(1, 1, 0xD, 9, 0x240, 2);         // V4-16
     unpack(1, 1, 0xE, 4, 0x260, 1);         // V4-8
-    ps2host::Vu bulk(1), single(1);
-    ps2host::VifStream a, b;
+    // Elements that are not whole words: V3-16 (6 bytes), S-16, V2-8,
+    // V3-8, S-8, V4-5, unsigned too, the last word part-used.
+    auto bytes = [&](u32 cl, u32 wl, u32 format, u32 num, u32 address, u32 size, bool unsigned_ = false) {
+        words.push_back(0x01000000u | wl << 8 | cl);
+        words.push_back((0x60u | format) << 24 | num << 16 | address | (unsigned_ ? 0x4000u : 0u));
+        for (u32 i = 0; i < (num * size + 3) / 4; ++i) words.push_back(seed = seed * 1664525u + 1013904223u);
+    };
+    bytes(1, 1, 0x9, 7, 0x270, 6);          // V3-16
+    bytes(4, 4, 0x9, 9, 0x278, 6, true);
+    bytes(1, 1, 0x1, 5, 0x288, 2);          // S-16
+    bytes(1, 1, 0x6, 7, 0x290, 2);          // V2-8
+    bytes(4, 2, 0xA, 9, 0x2A0, 3);          // V3-8, skipping
+    bytes(1, 1, 0x2, 11, 0x2C0, 1, true);   // S-8
+    bytes(1, 1, 0xF, 5, 0x2D0, 2);          // V4-5
+    // Masked and added (STMOD 1, as Burnout 3's offset rows), accumulated
+    // (STMOD 2), each with a mask using all four sources and the cycle's
+    // positions past 3 (WL 6): what UnpackRun's selects store.
+    auto set = [&](u32 command, std::initializer_list<u32> data) {
+        words.push_back(command);
+        for (u32 d : data) words.push_back(d);
+    };
+    set(0x20000000u, {0xE4B1D872u});                        // STMASK: 0-3 in every arrangement
+    set(0x30000000u, {0x47800000u, 0x11111111u, 0x22222222u, 0x33333333u});      // STROW
+    set(0x31000000u, {0x44444444u, 0x55555555u, 0x66666666u, 0x77777777u});      // STCOL
+    for (u32 mode : {0u, 1u, 2u}) {
+        words.push_back(0x05000000u | mode);               // STMOD
+        auto masked = [&](u32 cl, u32 wl, u32 format, u32 num, u32 address, u32 per) {
+            words.push_back(0x01000000u | wl << 8 | cl);
+            words.push_back((0x70u | format) << 24 | num << 16 | address);     // UNPACK, masked
+            for (u32 i = 0; i < num * per; ++i) words.push_back(seed = seed * 1664525u + 1013904223u);
+        };
+        const u32 at = 0x280 + mode * 0x40;
+        masked(4, 4, 0xC, 9, at, 4);                        // V4-32
+        masked(6, 6, 0x8, 7, at + 0x10, 3);                 // V3-32, positions past 3
+        masked(4, 2, 0xD, 6, at + 0x20, 2);                 // V4-16 skipping
+        masked(1, 1, 0xE, 5, at + 0x30, 1);                 // V4-8
+        unpack(4, 4, 0xC, 5, at + 0x38, 4);                 // unmasked, added (modes 1, 2)
+        unpack(1, 1, 0x8, 3, at + 0x3D, 3);
+        bytes(1, 1, 0x9, 3, at + 0x2E, 6);                  // V3-16, added
+        auto masked_bytes = [&](u32 cl, u32 wl, u32 format, u32 num, u32 address, u32 size) {
+            words.push_back(0x01000000u | wl << 8 | cl);
+            words.push_back((0x70u | format) << 24 | num << 16 | address);
+            for (u32 i = 0; i < (num * size + 3) / 4; ++i) words.push_back(seed = seed * 1664525u + 1013904223u);
+        };
+        masked_bytes(6, 6, 0x9, 7, at + 0x08, 6);           // V3-16 masked, positions past 3
+        masked_bytes(4, 2, 0x1, 5, at + 0x18, 2);           // S-16 masked, skipping
+        masked_bytes(1, 1, 0xA, 3, at + 0x1E, 3);           // V3-8 masked
+        masked_bytes(1, 1, 0xF, 3, at + 0x25, 2);           // V4-5 masked
+    }
+    words.push_back(0x05000000u);                           // STMOD 0 again
+    ps2host::Vu bulk(1), single(1), chunked(1);
+    ps2host::VifStream a, b, c;
     a.vu = &bulk;
     b.vu = &single;
+    c.vu = &chunked;
     a.Words(words.data(), u32(words.size()), 0);
-    for (u32 w : words) b.Words(&w, 1, 0);
+    for (u32 w : words) b.Word(w);              // the byte buffer's way, word by word
+    for (u32 i = 0; i < words.size(); i += 5) c.Words(words.data() + i, std::min<u32>(5, u32(words.size()) - i), 0);
     Check(std::memcmp(bulk.Quad(0), single.Quad(0), 1024 * 16) == 0,
           "UNPACKs in runs store what they do a word at a time");
+    Check(std::memcmp(chunked.Quad(0), single.Quad(0), 1024 * 16) == 0,
+          "UNPACKs in runs of five words (elements split between runs) store what they do a word at a time");
 }
 
 void Path3GoesOneGroupPerWindow() {
@@ -466,6 +522,43 @@ void Path3GoesOneGroupPerWindow() {
     queue.Release(false, [&](u32 word) { sent.push_back(word); });
     Check(first && sent.size() == 8 && std::equal(sent.begin(), sent.end(), words->begin() + 12) && queue.empty(),
           "held runs, borrowed or copied, go a group at a time with a tag split between them");
+}
+
+// CLUT loads (TEX0, CLD 1) from random memory: every CSM1 CLUT format, 8- and
+// 4-bit textures, CSA, a base at memory's end (the entries wrap), against the
+// entries Memory::Read finds where the GS manual puts them.
+void GsLoadsCluts() {
+    using namespace ps2host::gs;
+    Gs gs;
+    gs.rasterize = false;
+    u32 seed = 11;
+    for (u32 i = 0; i < (4u << 20); i += 4) {
+        seed = seed * 1664525u + 1013904223u;
+        std::memcpy(gs.memory.data() + i, &seed, 4);
+    }
+    gs.WriteRegister(0x3B, u64(0x80) | u64(1) << 15 | u64(0x40) << 32);       // TEXA: TA0 0x80, AEM, TA1 0x40
+    bool all = true;
+    for (u32 cpsm : {0x0u, 0x1u, 0x2u, 0xAu})
+        for (u32 psm : {u32(PSMT8), u32(PSMT4)})
+            for (u32 cbp : {0x2C40u, 0x3FFCu, 0x1234u})
+                for (u32 csa : {0u, 5u, 31u}) {
+                    const u64 tex0 = u64(psm) << 20 | u64(cbp) << 37 | u64(cpsm) << 51 | u64(csa) << 56 | u64(1) << 61;
+                    gs.WriteRegister(0x06, tex0);
+                    const auto& clut = gs.Clut();
+                    const bool eight = psm == PSMT8;
+                    for (u32 i = 0; i < (eight ? 256u : 16u); ++i) {
+                        const u32 p = eight ? (i & 0xE7) | ((i & 0x08) << 1) | ((i & 0x10) >> 1) : i;
+                        const u32 x = eight ? p % 16 : p % 8, y = eight ? p / 16 : p / 8;
+                        const u32 raw = gs.memory.Read(cbp, 1, x, y, cpsm == 0 ? PSMCT32 : cpsm);
+                        u32 want;
+                        if (cpsm == 0) want = raw;
+                        else if (cpsm == 1) want = (raw & 0xFFFFFF) | (!(raw & 0xFFFFFF) ? 0u : 0x80u) << 24;
+                        else want = (raw & 0x1F) << 3 | ((raw >> 5) & 0x1F) << 11 | ((raw >> 10) & 0x1F) << 19 |
+                                    ((raw & 0x8000) ? 0x40u : ((raw & 0x7FFF) ? 0x80u : 0u)) << 24;
+                        if (clut[eight ? i : (csa * 16 + i) % 256] != want) all = false;
+                    }
+                }
+    Check(all, "CLUT loads take every entry from where the GS keeps it, each format, with TEXA's alpha");
 }
 
 // Fog (PRIM.FGE): C = (F * C + (255 - F) * FOGCOL) >> 8, F from XYZF2 or the
@@ -1871,7 +1964,11 @@ void LibnetSendsDatagrams() {
     libnet::Options options;
     options.address_env = "PS2HOST_TEST_LAN_IP";
     options.dump_env = nullptr;
+#ifdef _WIN32
     _putenv_s("PS2HOST_TEST_LAN_IP", "127.0.0.1");
+#else
+    setenv("PS2HOST_TEST_LAN_IP", "127.0.0.1", 1);
+#endif
     libnet::Register(client, options);
     ps2host::Memory& m = ps2host::GuestMemory();
     lifted::Context c{};
@@ -2019,6 +2116,26 @@ void BlanksLockToTheScreen() {
 #endif
 }
 
+void CustomSongsScanAndName() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "ps2host_custom_songs_test";
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+    fs::create_directories(dir);
+    for (const wchar_t* name : {L"b band - Second Song.mp3", L"A Band - First Song.MP3", L"Lonely.mp3", L"notes.txt",
+                                L"Caf\u00E9  Tacuba - Ojal\u00E1   que.mp3"})
+        std::ofstream(dir / fs::path(name), std::ios::binary);
+    const std::vector<ps2host::CustomSong> songs = ps2host::ScanCustomSongs(dir, 3, 12);
+    Check(songs.size() == 3, "custom songs: MP3s alone, the first 3 by name");
+    Check(songs[0].artist == u"A Band" && songs[0].title == u"First Song", "custom songs: Artist - Title, any case's .mp3");
+    Check(songs[1].artist == u"b band", "custom songs: by file name in any case");
+    Check(songs[2].artist == u"Cafe Tacuba" && songs[2].title == u"Ojala que", "custom songs: accents plain, spaces squeezed");
+    const ps2host::CustomSong alone = ps2host::CustomSongOf(dir / "Lonely.mp3", 12);
+    Check(alone.title == u"Lonely" && alone.artist == u"Unknown Artist", "custom songs: no dash, the name is the title");
+    Check(ps2host::CustomSongText(L"A Very Long Song Name", 12) == u"A Very Lo...", "custom songs: cut with ...");
+    fs::remove_all(dir, ignored);
+}
+
 void BindingsKeepAndSwap() {
     namespace b = ps2host::bindings;
     b::Table defaults{};
@@ -2051,6 +2168,7 @@ void BindingsKeepAndSwap() {
 int main() {
     BlanksLockToTheScreen();
     BindingsKeepAndSwap();
+    CustomSongsScanAndName();
     HudAnchorsAndPlaces();
     LibnetSendsDatagrams();
     OverlaysRunWhatIsLoaded();
@@ -2066,6 +2184,7 @@ int main() {
     DmaChainsAreWalked();
     GsLayoutsArePermutations();
     GsDrawsASprite();
+    GsLoadsCluts();
     GsFogsTowardsFogcol();
     GsLoadsACsm2Clut();
     Path3GoesOneGroupPerWindow();

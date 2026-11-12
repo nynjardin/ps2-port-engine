@@ -49,6 +49,16 @@ public:
         (void)due_ns;
         return PresentImage(image, layout, width, height);
     }
+    /* PresentImageAt in two halves: the image copied now and held - not
+       shown, and not given up for a newer one - its slot returned (-1: none
+       to hold it in); ShowHeld gives it its time later, after pictures sent
+       meanwhile (a picture made between two: the later one copied before the
+       one between was drawn over it, shown after it). */
+    virtual int HoldImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) {
+        (void)image, (void)layout, (void)width, (void)height;
+        return -1;
+    }
+    virtual void ShowHeld(int slot, std::uint64_t due_ns) { (void)slot, (void)due_ns; }
 
     /* Handles the window's events; false once it has been closed. Alt+Enter
        toggles fullscreen. */
@@ -245,6 +255,27 @@ public:
 /* A window with a Vulkan swapchain; null, with `error` saying why, when there is
    no Vulkan device or window to be had. */
 std::unique_ptr<Display> CreateVulkanDisplay(const char* title, int width, int height, std::string* error);
+/* A window drawn with Direct3D 11 (Windows; feature level 11_0): its device
+   a Gpu of Api::kD3D11 (SharedGpu). Null, with `error`, when there is none. */
+std::unique_ptr<Display> CreateD3D11Display(const char* title, int width, int height, std::string* error);
+/* A window drawn with SDL's own 2D renderer (OpenGL, or its software one):
+   the last resort, without a GPU for the GS (SharedGpu null; Present's
+   pixels only). Null, with `error`, when SDL has no window or renderer. */
+std::unique_ptr<Display> CreateSdlDisplay(const char* title, int width, int height, std::string* error);
+
+/* On-screen controls (a touch screen's: Android's activity draws them, over
+   the picture) as one more controller, a DualShock 2's: its state as they
+   hold it, and whether they are shown - listed among the controllers
+   (Controllers, id kTouchPadId, PlayStation marks) only then. */
+/* Whether a window reads the PC's controllers (the default). A scripted
+   run's does not: a controller the player is using for something else would
+   press in it. Before the window opens. */
+void UseControllers(bool use);
+
+constexpr std::uint32_t kTouchPadId = 0x7F000001u;
+void SetTouchPad(const Display::PadState& state);
+void ShowTouchPad(bool shown);
+bool TouchPadShown();
 
 }  // namespace ps2gpu
 

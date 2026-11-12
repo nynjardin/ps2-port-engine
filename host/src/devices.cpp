@@ -38,6 +38,7 @@
 #include <string>
 #include <vector>
 
+#include "ps2host/platform.h"
 #include "ps2host/dma.h"
 #include "ps2host/timeline.h"
 #ifdef PS2HOST_VULKAN
@@ -596,8 +597,12 @@ void StartCapture(u64 frame) {
     }
     g_capture_dir = dir.string();
     // Two frames: a game drawing a picture every other blank (Burnout 3)
-    // draws nothing in one of them.
-    g_capture_frame = (long long)frame + 2;
+    // draws nothing in one of them. PS2HOST_CAPTURE_FRAMES=N: N of them in
+    // replay.bin (pictures one after another, for engine/tools/gsmatch.py).
+    static const long long frames = std::getenv("PS2HOST_CAPTURE_FRAMES")
+                                        ? std::max(2LL, std::atoll(std::getenv("PS2HOST_CAPTURE_FRAMES")))
+                                        : 2;
+    g_capture_frame = (long long)frame + frames;
     GpuCaptureBegin(frame + 1, (dir / "passes").string());
     gs::Gs& g = gs::TheGs();
     // The frames' GS stream (replay.bin), for --gs-replay: memory as it is
@@ -654,6 +659,7 @@ void FrameDone(u64 frame) {
     FrameTimes(frame);
     MusicBlank();
     timeline::Frame(frame);
+    HeavyThreadsFrame();                // a phone's: the frame's work told to the system
     SampleFrame(frame);
     Vu::SnapshotFrame(frame);
     // Time passes: unmasked, PATH3 sends what it still holds (in turn with

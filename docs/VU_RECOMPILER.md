@@ -120,3 +120,75 @@ comparison with a profiled build).
 
 Steps 2-4 need an entry version per known edge: code grows; only edges a
 recorded run took (PS2HOST_VU_BY_BLOCK counts) are worth one.
+
+## 2026-10-29, night: CLIP, and where a pair's time is now
+
+Measured with the same benches (`--vu-fast --vu-bench`, the crash, the
+pile-up and the race snapshots; two `--no-pgo` builds side by side, twice).
+
+9. **CLIP without branches** (done, engine da8aa95 and a2929f7). ClipJudge
+   was a scalar loop with a data-dependent branch a lane (a vertex's
+   judgement), ~8% of the compiled code's samples in the pile-up. Now the
+   three lanes' magnitudes are compared at once, and each lane's two bits
+   are put in place in the vector and ORed across (no table lookups after
+   a movemask); ft is read whole, not its w alone just after a pair stored
+   the register. Fast bench: crash 42.5 -> 40.3 ms, pile-up 42.2 -> 39.2,
+   race 37.4 -> 34.9 (-5 to -7%); exact pile-up 71.4 -> 66.8; every hash
+   the same.
+
+Tried, dropped (all exact, hashes the same):
+- *Stalls settled by the generator* within a block - a check on a field
+  the block itself wrote after its last pair with a run-time stall, the
+  stall's cycles known: only 851 of ~17,000 checks could be (most read
+  fields written before the block); pile-up -3%, race +1-4%: no clear gain.
+- *The run's count, cycle, pending branch and E bit as the blocks'
+  arguments* (registers from block to block, stored only where one returns
+  to the driver), against the ~5% of samples in the blocks' entry and exit
+  lines: pile-up and race +2.5% (register pressure in the blocks).
+- *DIV's and SQRT's results not cleaned* (they are clean under a run's
+  control word): no measurable change.
+
+**Where a pair's time goes now.** A 48-pair fast block of the pile-up's
+hottest program (Program70 0CA8), compiled: 807 instructions, of which the
+arithmetic is 46 (25 vmulps, 21 vaddps); the operand clamps ~138 (vpand,
+vpminud, vpor: three times the arithmetic); vector loads and stores of the
+VF registers 132; ~300 scalar (VI registers, addresses, the flags and the
+timing). At ~1.15 ns a pair the code runs near four instructions a cycle:
+it is bound by how many it has, not by one part. The registers' traffic,
+counted: of the block's 76 VF loads, 58 are a register's first read in the
+block and 18 read one again (7 after a store of it) - so VF held in host
+registers across a block's pairs (loaded at the first read, stored at the
+exits; a rewrite of the emitter and VuCore's operations) would save the 18
+and some overwritten stores, ~4% of the instructions: not worth it. What
+is left is across blocks (the first reads and last writes, superblocks)
+and the clamps of operands from before the block (step 8's ceiling).
+
+## 2026-10-30: a hand-written native loop (Burn3's idea), measured
+
+The idea from github.com/UwUCammie/Burn3: a game's hot VU1 code written by
+hand as native C++, checked against the emulated code. Tried on Burnout 3's
+microcode 2678EB26 (entry 0x1548: 12-20% of VU1 in every scene), whose
+hottest stretch by pairs is the strip loop at 0x08E0-0x09B0 (27 pairs, two
+vertices a pass; ~30% of the program's pairs, 6% of the bench's).
+
+How: vurecomp took `--natives DIR` (a list of loop starts, pass lengths and
+the FNV-1a of the pass's words, and the game's .cpp files) and called the
+native function at the start of the fast entry version of the back edge -
+only where the pass has no stall checks or Q/P landing - for every pass that
+goes round again, the compiled block then running the last. The native pass:
+the pairs' own steps with VF and VI in locals, the loop's matrix clamped
+once, the flags and CLIP history as the block leaves them. Exact: every
+hash of the three snapshots the same.
+
+Result: no gain. The loop is ~4% of the VU work in the samples (1.2-1.4% of
+the bench process, the rest of which is the harness), ~0.26 ns a pair -
+a quarter of the program's average. Clang already keeps a wait-free block's
+registers in host registers (the block's `__restrict` state), so what a
+native version removes - VF loads and stores, the per-pair bookkeeping - is
+mostly gone already from straight loops: native 1.3% + the block's last pass
+0.2% against 1.4%; the bench -1%, within the noise. The program's time is
+spread over dozens of branchy blocks (the clip walker, the dispatch through
+`jr vi15`) at 0.3-1.8% each; a hand translation of those would remove block
+boundaries at most. The hook was reverted (its diff and the native pass are
+kept outside the repository). Not again for straight loops; what is left in
+VU1 is block entries and exits and branchy code, the across-block items above.

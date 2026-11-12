@@ -101,6 +101,8 @@ struct VuRunState {
    which keeps its few values itself. */
 #if defined(__clang__) && defined(__x86_64__)
 #define PS2HOST_VU_BLOCK __attribute__((preserve_none, no_stack_protector))
+#elif defined(__clang__) && defined(__aarch64__)
+#define PS2HOST_VU_BLOCK __attribute__((no_stack_protector))
 #else
 #define PS2HOST_VU_BLOCK
 #endif
@@ -111,7 +113,7 @@ using VuBlock = void (PS2HOST_VU_BLOCK*)(Vu& __restrict vu, VuRunState& __restri
    as it has, and returns to that loop otherwise. 2.5 frames of a race's VU1
    work entered 700,000 blocks, each through the loop and a call it could
    not foresee. Without clang the loop calls it. */
-#if defined(__clang__) && defined(__x86_64__)
+#if defined(__clang__) && (defined(__x86_64__) || defined(__aarch64__))
 #define PS2HOST_VU_NEXT(block) [[clang::musttail]] return block(v, s, limit)
 #else
 #define PS2HOST_VU_NEXT(block) return
@@ -603,8 +605,13 @@ struct VuCore {
         const __m128 x = _mm_mul_ps(
             _mm_castsi128_ps(lifted::CleanLanes(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])))),
             _mm_set1_ps(kScaleF[Shift]));
+#if defined(__aarch64__)
+        // NEON's conversion saturates both ways itself.
+        const __m128i value = _mm_cvttps_epi32(x);
+#else
         const __m128i over = _mm_castps_si128(_mm_cmpge_ps(x, _mm_set1_ps(2147483648.0f)));
         const __m128i value = _mm_xor_si128(_mm_cvttps_epi32(x), over);
+#endif
         __m128i* to = reinterpret_cast<__m128i*>(v.regs.vf[ft]);
         if constexpr (Dest == 15) _mm_storeu_si128(to, value);
         else _mm_storeu_si128(to, Blend(LaneMask(Dest), value, _mm_loadu_si128(to)));
@@ -661,12 +668,41 @@ struct VuCore {
         return exponent == 0 ? 0 : exponent == 0x7F800000u ? lifted::kMax : bits & 0x7FFFFFFFu;
     }
     static PS2HOST_VU_INLINE void ClipJudge(Vu& v, int fs, int ft) {
+#if PS2RT_VU_SSE
+        /* The three lanes at once, without a branch (a vertex's judgement is
+           data, and a branch a lane mispredicted): CleanMagnitude in lanes,
+           every magnitude at most 0x7FFFFFFF, so the signed compare is the
+           unsigned one. */
+        auto magnitude = [](__m128i bits) {
+            const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+            const __m128i denormal = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
+            const __m128i special = _mm_cmpeq_epi32(exponent, _mm_set1_epi32(0x7F800000));
+            const __m128i m = _mm_andnot_si128(denormal, _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)));
+            return _mm_or_si128(_mm_andnot_si128(special, m), _mm_and_si128(special, _mm_set1_epi32(int(lifted::kMax))));
+        };
+        // ft whole (a lane of it alone, read just after a pair stored the
+        // register, waited for the store), its w in every lane.
+        const __m128i f = _mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs]));
+        const __m128i w = _mm_shuffle_epi32(magnitude(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[ft]))),
+                                            _MM_SHUFFLE(3, 3, 3, 3));
+        const __m128i over = _mm_cmpgt_epi32(magnitude(f), w);
+        // Each lane's two bits in place (x's 0-1, y's 2-3, z's 4-5; w none),
+        // then the lanes ORed together.
+        const __m128i negative = _mm_srai_epi32(f, 31);
+        __m128i bits = _mm_or_si128(_mm_and_si128(_mm_andnot_si128(negative, over), _mm_set_epi32(0, 16, 4, 1)),
+                                    _mm_and_si128(_mm_and_si128(negative, over), _mm_set_epi32(0, 32, 8, 2)));
+        bits = _mm_or_si128(bits, _mm_shuffle_epi32(bits, _MM_SHUFFLE(2, 3, 0, 1)));
+        bits = _mm_or_si128(bits, _mm_shuffle_epi32(bits, _MM_SHUFFLE(1, 0, 3, 2)));
+        const u32 judgement = u32(_mm_cvtsi128_si32(bits));
+        v.clip_latest_ = ((v.clip_latest_ << 6) | judgement) & 0xFFFFFF;
+#else
         const u32* f = v.regs.vf[fs];
         const u32 w = CleanMagnitude(v.regs.vf[ft][3]);
         u32 judgement = 0;
         for (int lane = 0; lane < 3; ++lane)
             if (CleanMagnitude(f[lane]) > w) judgement |= (f[lane] >> 31 ? 2u : 1u) << (2 * lane);
         v.clip_latest_ = ((v.clip_latest_ << 6) | judgement) & 0xFFFFFF;
+#endif
     }
     /* MAC: zero (bits 3-0) and sign (7-4) of each written field, x highest;
        `out` the register the upper wrote (Target: -1 ACC, 0 VF0 - the result

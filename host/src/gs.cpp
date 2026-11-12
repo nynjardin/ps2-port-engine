@@ -11,6 +11,7 @@
  */
 
 #include "ps2host/gs.h"
+#include "ps2host/gs_blend.h"
 #include "ps2host/profile.h"
 #include "ps2host/dma.h"
 #include "gs_decode.h"
@@ -59,6 +60,58 @@ Gs& MakeGs() {
     return gs;
 }
 }  // namespace detail
+
+
+void Gs::Keep(int path, const u32* words, u32 count) {
+    if (path < 1 || path > 3) return;
+    std::vector<u32>& to = keep_->paths[path - 1];
+    keep_->entries.push_back({'W', u8(path), 0, 0, u32(to.size()), count});
+    to.insert(to.end(), words, words + count);
+}
+
+struct Gs::Saved {
+    Context ctx[2];
+    u64 prim, prmode, prmodecont, texclut, texa, fogcol, dthe, colclamp, pabe;
+    u64 bitbltbuf, trxpos, trxreg, trxdir;
+    Vertex queue[3];
+    u32 queued, strip, trx_x, trx_y, trx_partial, trx_partial_bytes, cbp0, cbp1;
+    bool trx_active;
+    std::shared_ptr<std::array<u32, 256>> clut;
+    GifState gif;
+};
+
+std::shared_ptr<Gs::Saved> Gs::Save() const {
+    auto s = std::make_shared<Saved>();
+    s->ctx[0] = ctx_[0];
+    s->ctx[1] = ctx_[1];
+    s->prim = prim_; s->prmode = prmode_; s->prmodecont = prmodecont_; s->texclut = texclut_; s->texa = texa_;
+    s->fogcol = fogcol_; s->dthe = dthe_; s->colclamp = colclamp_; s->pabe = pabe_;
+    s->bitbltbuf = bitbltbuf_; s->trxpos = trxpos_; s->trxreg = trxreg_; s->trxdir = trxdir_;
+    for (int i = 0; i < 3; ++i) s->queue[i] = queue_[i];
+    s->queued = queued_; s->strip = strip_; s->trx_x = trx_x_; s->trx_y = trx_y_; s->trx_partial = trx_partial_;
+    s->trx_partial_bytes = trx_partial_bytes_; s->cbp0 = cbp0_; s->cbp1 = cbp1_; s->trx_active = trx_active_;
+    s->clut = clut_;
+    s->gif = gif;
+    return s;
+}
+
+void Gs::Restore(const Saved& s) {
+    ctx_[0] = s.ctx[0];
+    ctx_[1] = s.ctx[1];
+    prim_ = s.prim; prmode_ = s.prmode; prmodecont_ = s.prmodecont; texclut_ = s.texclut; texa_ = s.texa;
+    fogcol_ = s.fogcol; dthe_ = s.dthe; colclamp_ = s.colclamp; pabe_ = s.pabe;
+    bitbltbuf_ = s.bitbltbuf; trxpos_ = s.trxpos; trxreg_ = s.trxreg; trxdir_ = s.trxdir;
+    for (int i = 0; i < 3; ++i) queue_[i] = s.queue[i];
+    queued_ = s.queued; strip_ = s.strip; trx_x_ = s.trx_x; trx_y_ = s.trx_y; trx_partial_ = s.trx_partial;
+    trx_partial_bytes_ = s.trx_partial_bytes; cbp0_ = s.cbp0; cbp1_ = s.cbp1; trx_active_ = s.trx_active;
+    clut_ = s.clut;
+    gif = s.gif;
+    ++register_writes_;                 // (what was drawn with the registers as they were is stale for the bridge)
+}
+
+void Gs::FreshDecode() {
+    for (GifState::Path& p : gif.paths) p = GifState::Path{};
+}
 
 // ---------------------------------------------------------------- GIF
 
@@ -352,6 +405,49 @@ void Gs::LoadClut(u64 tex0) {
     // (TEXCLUT COU * 16 + i, COV) in a buffer CBW wide - no swizzle, no CSA.
     const bool csm2 = Bits(tex0, 55, 1);
     const u32 cbw = csm2 ? std::max<u32>(1, Bits(texclut_, 0, 6)) : 1;
+    const u32 format = cpsm == 0 ? PSMCT32 : cpsm;
+    if (!csm2 && (format == PSMCT32 || format == PSMCT24 || format == PSMCT16 || format == PSMCT16S)) {
+        // CSM1, the usual: every entry inside the CLUT's first page, so its
+        // byte is the base block's (cbp * 256) plus where the page puts it -
+        // the same each load: the entries' offsets once a format, the bytes
+        // read straight (Burnout 3 loads ~650 CLUTs a frame in a pile-up,
+        // 256 Memory::Read each were a twentieth of the GS thread).
+        struct Offsets {
+            u32 at[4][2][256];      // [format: CT32, CT24, CT16, CT16S][eight][entry]
+            Offsets() {
+                const u32 formats[4] = {PSMCT32, PSMCT24, PSMCT16, PSMCT16S};
+                for (u32 f = 0; f < 4; ++f)
+                    for (u32 e = 0; e < 2; ++e)
+                        for (u32 i = 0; i < (e ? 256u : 16u); ++i) {
+                            const u32 p = (i & 0xE7) | ((i & 0x08) << 1) | ((i & 0x10) >> 1);
+                            u32 nibble = 0;
+                            at[f][e][i] = e ? Memory::Address(0, 1, p % 16, p / 16, formats[f], &nibble)
+                                            : Memory::Address(0, 1, i % 8, i / 8, formats[f], &nibble);
+                        }
+            }
+        };
+        static const Offsets offsets;
+        const u32 f = format == PSMCT32 ? 0 : format == PSMCT24 ? 1 : format == PSMCT16 ? 2 : 3;
+        const u32* at = offsets.at[f][eight ? 1 : 0];
+        const u8* bytes = memory.data();
+        const u32 base = cbp * 256;
+        constexpr u32 kMemoryMask = (4u << 20) - 1;
+        for (u32 i = 0; i < count; ++i) {
+            const u8* p = bytes + ((base + at[i]) & kMemoryMask);
+            u32 color;
+            if (f == 0) {
+                color = u32(p[0]) | u32(p[1]) << 8 | u32(p[2]) << 16 | u32(p[3]) << 24;
+            } else if (f == 1) {
+                const u32 rgb = u32(p[0]) | u32(p[1]) << 8 | u32(p[2]) << 16;
+                color = rgb | ((Bits(texa_, 15, 1) && !rgb) ? 0 : Bits(texa_, 0, 8)) << 24;
+            } else {
+                color = From16(u32(p[0]) | u32(p[1]) << 8, texa_);
+            }
+            (*clut)[eight ? i : (csa * 16 + i) % 256] = color;
+        }
+        clut_ = clut;
+        return;
+    }
     for (u32 i = 0; i < count; ++i) {
         // CSM1: an 8-bit CLUT is a 16x16 image with index bits 3 and 4 swapped;
         // a 4-bit one an 8x2 image.
