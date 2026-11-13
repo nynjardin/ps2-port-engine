@@ -30,6 +30,8 @@ What is the game's own comes from its game.json:
                "extras": {path in the zip: file in the game's directory}
                - more text files for the player (a texture pack folder's
                README, say), written with Windows line ends}.
+               "flat": true puts the files at the archive's root, with no
+               folder of the release's name around them.
 The player README is the game's port/release/README.txt.
 """
 
@@ -230,14 +232,15 @@ def main():
     out_dir = os.path.join(build, "release")
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, "%s-windows-x64.zip" % name)
+    top = "" if release.get("flat") else name + "/"
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        z.write(exe, "%s/%s.exe" % (name, target))
-        z.write(exe_sse4, "%s/%s-sse4.exe" % (name, target))
-        z.writestr("%s/README.txt" % name, readme.replace("\n", "\r\n"))
-        z.writestr("%s/THIRD-PARTY-NOTICES.txt" % name, text)
+        z.write(exe, "%s%s.exe" % (top, target))
+        z.write(exe_sse4, "%s%s-sse4.exe" % (top, target))
+        z.writestr("%sREADME.txt" % top, readme.replace("\n", "\r\n"))
+        z.writestr("%sTHIRD-PARTY-NOTICES.txt" % top, text)
         for inside, source in (release.get("extras") or {}).items():
             with open(os.path.join(game, source), encoding="utf-8") as f:
-                z.writestr("%s/%s" % (name, inside), f.read().replace("\n", "\r\n"))
+                z.writestr(top + inside, f.read().replace("\n", "\r\n"))
     print("package: %s (%.1f MB; imports %s)" % (out, os.path.getsize(out) / 1e6, ", ".join(dlls)))
 
 
@@ -258,6 +261,7 @@ def package_linux(game, target, title, version, release, build, cmake, root):
     out_dir = os.path.join(build, "release")
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, "%s-linux-x64.tar.gz" % name)
+    top = "" if release.get("flat") else name + "/"
     now = time.time()
 
     def add_bytes(tar, path, data, mode=0o644):
@@ -269,12 +273,12 @@ def package_linux(game, target, title, version, release, build, cmake, root):
 
     with tarfile.open(out, "w:gz", compresslevel=9) as tar:
         with open(exe, "rb") as f:
-            add_bytes(tar, "%s/%s" % (name, target), f.read(), 0o755)
-        add_bytes(tar, "%s/README.txt" % name, readme.encode("utf-8"))
-        add_bytes(tar, "%s/THIRD-PARTY-NOTICES.txt" % name, text.replace("\r\n", "\n").encode("utf-8"))
+            add_bytes(tar, top + target, f.read(), 0o755)
+        add_bytes(tar, top + "README.txt", readme.encode("utf-8"))
+        add_bytes(tar, top + "THIRD-PARTY-NOTICES.txt", text.replace("\r\n", "\n").encode("utf-8"))
         for inside, source in (release.get("extras") or {}).items():
             with open(os.path.join(game, source), encoding="utf-8") as f:
-                add_bytes(tar, "%s/%s" % (name, inside), f.read().encode("utf-8"))
+                add_bytes(tar, top + inside, f.read().encode("utf-8"))
     print("package: %s (%.1f MB; needs %s)" % (out, os.path.getsize(out) / 1e6, ", ".join(needed)))
 
 
