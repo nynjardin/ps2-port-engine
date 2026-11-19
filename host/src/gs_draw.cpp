@@ -298,7 +298,11 @@ void Gs::Draw() {
     // a timer per primitive is a measurable share of a race.
     std::optional<Timed> timed;
     ++primitives_;
-    if (skip_draws) {
+    if (hold_draws_) {                  // (a native draw drew it: Native)
+        if (on_held) on_held(DrawCall{Prim(), &Ctx(), texa_, queue_, queued_, fogcol_, (pabe_ & 1) != 0, register_writes_});
+        return;
+    }
+    if (skip_draws) {                   // a picture the frame skip leaves out
         setup_stale_ = true;
         return;
     }

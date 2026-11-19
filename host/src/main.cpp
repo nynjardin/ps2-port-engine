@@ -35,10 +35,12 @@
 #include <SDL3/SDL.h>           // (a player's messages: SDL's message box)
 #endif
 
+#include "ps2host/crash_report.h"
 #include "ps2host/disc.h"
 #include "ps2host/host.h"
 #include "ps2host/run.h"
 #include "ps2host/settings.h"
+#include "ps2host/updater.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -78,6 +80,7 @@ bool HasAvx2() {
 }
 
 std::string g_log;     // the log a run started without arguments writes
+std::filesystem::path g_here;      // ...beside the game, with the player's files
 
 #ifdef PS2HOST_GAME_EXECUTABLE
 /* Whether `path` is an image of the game's disc: the executable it boots is
@@ -183,18 +186,25 @@ std::filesystem::path PlayerFolder(const std::filesystem::path& program) {
 /* What the run says, to `log` (no terminal to read): opened once, shared, and
    given to both streams - their lines in the order they were written. */
 void LogTo(const std::string& log) {
-    // The runs before stay readable: burnout3.log moves to burnout3.1.log, .1 to .2,
-    // and so on; the oldest of the five kept goes.
+    // The runs before stay readable: <name>.1.log is the last one, .2 the one
+    // before, and so on (five kept); and <name>.prev.log, the last one too, is
+    // what the crash report sends: a game that froze or crashed is started again
+    // at once, and its log was the one report of it.
     {
         constexpr int kept = 5;
         const std::filesystem::path path(log);
         const auto older = [&](int n) {
             return path.parent_path() / (path.stem().string() + "." + std::to_string(n) + ".log");
         };
-        std::error_code ignored;
-        std::filesystem::remove(older(kept), ignored);
-        for (int n = kept - 1; n >= 1; --n) std::filesystem::rename(older(n), older(n + 1), ignored);
-        std::filesystem::rename(path, older(1), ignored);
+        std::error_code error;
+        std::filesystem::path prev(log);
+        prev.replace_extension(".prev.log");
+        if (std::filesystem::exists(log, error)) {
+            std::filesystem::remove(older(kept), error);
+            for (int n = kept - 1; n >= 1; --n) std::filesystem::rename(older(n), older(n + 1), error);
+            std::filesystem::copy_file(path, older(1), std::filesystem::copy_options::overwrite_existing, error);
+            std::filesystem::rename(log, prev, error);
+        }
     }
 #ifdef _WIN32
     std::FILE* stream = nullptr;
@@ -309,6 +319,7 @@ std::vector<std::string> PlayArguments(const char* self) {
     // once, shared (fopen's would lock the file to one stream), and given to
     // both: their lines in the order they were written.
     g_log = std::filesystem::path(exe).stem().string() + ".log";     // (on Linux: the program's name, .log)
+    g_here = here;
     LogTo((here / g_log).string());
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
     return {self, "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
@@ -368,6 +379,11 @@ extern "C" JNIEXPORT void JNICALL Java_org_ps2port_PortActivity_nativeTouchShown
 
 int main(int argc, char** argv) {
     AttachTerminal();
+#ifdef PS2HOST_GAME_GITHUB
+    const ps2host::ReportGame report{PS2HOST_GAME_TITLE, PS2HOST_GAME_VERSION, PS2HOST_GAME_TARGET, PS2HOST_GAME_GITHUB};
+    // A crashed run's report (ps2host/crash_report.h: this program started again by the crash).
+    if (ps2host::IsCrashReportHelper(argc, argv)) return ps2host::CrashReportHelper(argc, argv, report);
+#endif
 #ifndef _WIN32
     // A send to a peer that went away (a LAN player leaving) an error, not
     // the end of the process.
@@ -395,6 +411,15 @@ int main(int argc, char** argv) {
     if (argc == 1) {
         play = PlayArguments(argv[0]);
         if (play.empty()) return 0;
+#if defined(_WIN32) && defined(PS2HOST_GAME_GITHUB)
+        // A player's run: its crashes reported, and a newer release offered
+        // (ps2host/crash_report.h, ps2host/updater.h) - installed, it starts
+        // in this one's place.
+        ps2host::ArmCrashReports(g_here, g_log, report);
+        if (ps2host::CheckForUpdate(g_here, {PS2HOST_GAME_TITLE, PS2HOST_GAME_VERSION, PS2HOST_GAME_TARGET,
+                                             PS2HOST_GAME_GITHUB, PS2HOST_GAME_RELEASE}))
+            return 0;
+#endif
         for (std::string& arg : play) play_argv.push_back(arg.data());
         play_argv.push_back(nullptr);
         argc = int(play.size());
@@ -418,7 +443,7 @@ int main(int argc, char** argv) {
         std::fflush(nullptr);
         const std::string text = "The game stopped because of an error. What happened is in " +
                                  g_log + ", beside the game.";
-        Tell(text, true);
+        if (!ps2host::ReportStop(code)) Tell(text, true);       // (a player's run: a crash report)
     }
     // What must be finished is (the report written, the settings and the
     // memory card saved as they changed, the WAV's header here); the rest -

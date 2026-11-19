@@ -30,6 +30,8 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/iop.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/sdk.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/hang_report.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/crash_report.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/updater.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/custom_songs.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/disc.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/cdvd.cpp
@@ -49,12 +51,14 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/music.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/presence.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vu.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/vu_native.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/timers.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/pc_menu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/window.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/settings.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/hud.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/libnet.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/networks.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/logitech.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/bindings.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/prompt_art.cpp
@@ -122,11 +126,15 @@ option(PS2HOST_AVX2 "Build for processors with AVX2 (off: SSE4.1)" ON)
 # A game executable's entry (ps2_add_port's /ENTRY), before the runtime: the
 # processor checked by code built without AVX - a library of its own, apart
 # from ps2rt's flags - and the SSE4 build started instead where it must be.
+# (Linux: an object of the executable's own - its .preinit_array entry,
+# referred to by nothing, would not be taken from a static library.)
 if(MSVC)
     add_library(ps2_cpu_check STATIC ${CMAKE_CURRENT_LIST_DIR}/src/cpu_check.cpp)
-    if(PS2HOST_AVX2)
-        target_compile_definitions(ps2_cpu_check PRIVATE PS2HOST_BUILT_FOR_AVX2=1)
-    endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    add_library(ps2_cpu_check OBJECT ${CMAKE_CURRENT_LIST_DIR}/src/cpu_check.cpp)
+endif()
+if(TARGET ps2_cpu_check AND PS2HOST_AVX2)
+    target_compile_definitions(ps2_cpu_check PRIVATE PS2HOST_BUILT_FOR_AVX2=1)
 endif()
 
 if(MSVC)
@@ -184,6 +192,8 @@ if(MSVC)
 endif()
 if(WIN32)
     target_link_libraries(ps2host PRIVATE ws2_32)         # the IOP's inet (iop_inet.cpp)
+    target_link_libraries(ps2host PRIVATE iphlpapi)       # this PC's networks (networks.cpp)
+    target_link_libraries(ps2host PRIVATE winhttp bcrypt) # the update check (updater.cpp)
 endif()
 if(NOT MSVC)
     # clang or GCC (Android's NDK): translated code throws lifted::Abort; no
@@ -311,7 +321,7 @@ function(ps2_add_port target)
         ${translated}
         ${PORT_SOURCES})
     endif()
-    if(MSVC)
+    if(TARGET ps2_cpu_check)
         target_link_libraries(${target} PRIVATE ps2_cpu_check)
     endif()
     target_link_libraries(${target} PRIVATE ps2host)
@@ -329,6 +339,21 @@ function(ps2_add_port target)
         if(no_version)
             set(game_version "0.0.0")
         endif()
+        # The update check's (updater.cpp): the GitHub repository ("release":
+        # {"github": "owner/repository"}) and the zip's name, as package.py
+        # makes it ("release": {"name"}, else the title's letters and digits
+        # and "-PC").
+        string(JSON game_github ERROR_VARIABLE no_github GET ${game_json} release github)
+        if(no_github)
+            set(game_github "")
+        endif()
+        string(JSON game_release ERROR_VARIABLE no_release_name GET ${game_json} release name)
+        if(no_release_name OR game_release STREQUAL "")
+            string(REGEX REPLACE "[^A-Za-z0-9]" "" game_release "${game_title}")
+            set(game_release "${game_release}-PC")
+        endif()
+        target_compile_definitions(${target} PRIVATE PS2HOST_GAME_GITHUB="${game_github}"
+                                                     PS2HOST_GAME_RELEASE="${game_release}")
         target_compile_definitions(${target} PRIVATE PS2HOST_GAME_NAME="${game_name}"
                                                      PS2HOST_GAME_TITLE="${game_title}"
                                                      PS2HOST_GAME_VERSION="${game_version}"

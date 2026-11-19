@@ -17,8 +17,9 @@ namespace ps2host {
 namespace {
 
 std::mutex g_lock;
-std::map<std::string, std::string> g_values;
-std::map<std::string, std::string> g_session;     // SessionSetting: over g_values, never written
+std::map<std::string, std::string> g_values;    // in effect: the file's, and a run's own (RunSetting)
+std::map<std::string, std::string> g_file;      // the file's: what is written
+std::map<std::string, std::string> g_session;   // SessionSetting: over g_values, never written
 std::string g_path;
 
 std::string Trim(const std::string& text) {
@@ -35,7 +36,7 @@ void Write() {
         return;
     }
     out << "# The PC port's settings (PC SETTINGS in the main menu).\n";
-    for (const auto& [key, value] : g_values) out << key << '=' << value << '\n';
+    for (const auto& [key, value] : g_file) out << key << '=' << value << '\n';
 }
 
 }  // namespace
@@ -44,13 +45,20 @@ void LoadSettings(const std::string& path) {
     std::lock_guard<std::mutex> hold(g_lock);
     g_path = path;
     g_values.clear();
+    g_file.clear();
     std::ifstream in(path);
     std::string line;
+    bool first = true;
     while (std::getline(in, line)) {
+        // A UTF-8 byte order mark before the first line (a file saved so by
+        // an editor, or PowerShell's Set-Content -Encoding utf8): not its
+        // key's - the first setting was lost to it.
+        if (first && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
+        first = false;
         const auto equals = line.find('=');
         if (line.empty() || line[0] == '#' || equals == std::string::npos) continue;
         const std::string key = Trim(line.substr(0, equals));
-        if (!key.empty()) g_values[key] = Trim(line.substr(equals + 1));
+        if (!key.empty()) g_values[key] = g_file[key] = Trim(line.substr(equals + 1));
     }
 }
 
@@ -71,8 +79,9 @@ bool SettingOn(const std::string& key, bool fallback) {
 
 void SetSetting(const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> hold(g_lock);
-    if (g_values.count(key) && g_values[key] == value) return;
     g_values[key] = value;
+    if (g_file.count(key) && g_file[key] == value) return;
+    g_file[key] = value;
     Write();
 }
 
@@ -80,7 +89,7 @@ void SetSettingOn(const std::string& key, bool on) { SetSetting(key, on ? "on" :
 
 void RunSetting(const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> hold(g_lock);
-    g_values[key] = value;
+    g_values[key] = value;          // (not the file's: --setting was written with the next change of any)
 }
 
 void SessionSetting(const std::string& key, const std::string& value) {

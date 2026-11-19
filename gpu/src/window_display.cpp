@@ -96,6 +96,143 @@ void WatchVblanks(std::shared_ptr<VblankWatch> watch, HWND window) {
     }
     if (output) output->Release();
 }
+
+/* The window moved and resized by the port, not by Windows' own loop.
+   Dragging the title bar or a border runs a loop of Windows' (DefWindowProc's
+   WM_NCLBUTTONDOWN: SC_MOVE / SC_SIZE) until the button is let go - and the
+   thread in it is the game's, which reads the window's messages once a
+   frame (Pump): the game stopped while the window moved. So the press is
+   taken here, before SDL dispatches it (SDL_SetWindowsMessageHook): the
+   pointer captured, the window moved or sized to it at each move the
+   frames' Pump reads, let go on the button's release - the game playing on.
+   What Windows' loop also did: a maximized window dragged by its title
+   comes back to its size under the pointer; let go at the top of the screen
+   it is maximized, at its left or right edge it takes that half; Escape
+   puts it back where it was. */
+struct WindowDrag {
+    HWND window = nullptr;      // the game's
+    WPARAM edge = 0;            // HTCAPTION or a border's hit-test code; 0: none under way
+    POINT from{};               // the pointer as it began (the screen's)
+    RECT rect{};                // the window then
+};
+WindowDrag g_drag;
+
+constexpr int kSmallestW = 320, kSmallestH = 240;
+
+const wchar_t* EdgeCursor(WPARAM edge) {
+    switch (edge) {
+        case HTLEFT: case HTRIGHT: return MAKEINTRESOURCEW(32644);              // IDC_SIZEWE
+        case HTTOP: case HTBOTTOM: return MAKEINTRESOURCEW(32645);              // IDC_SIZENS
+        case HTTOPLEFT: case HTBOTTOMRIGHT: return MAKEINTRESOURCEW(32642);     // IDC_SIZENWSE
+        case HTTOPRIGHT: case HTBOTTOMLEFT: return MAKEINTRESOURCEW(32643);     // IDC_SIZENESW
+        default: return MAKEINTRESOURCEW(32512);                                // IDC_ARROW
+    }
+}
+
+void DragTo(const POINT& at) {
+    const int dx = at.x - g_drag.from.x, dy = at.y - g_drag.from.y;
+    RECT n = g_drag.rect;
+    if (g_drag.edge == HTCAPTION) {
+        SetWindowPos(g_drag.window, nullptr, n.left + dx, n.top + dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return;
+    }
+    const WPARAM e = g_drag.edge;
+    if (e == HTLEFT || e == HTTOPLEFT || e == HTBOTTOMLEFT) n.left = std::min(n.left + dx, n.right - kSmallestW);
+    if (e == HTRIGHT || e == HTTOPRIGHT || e == HTBOTTOMRIGHT) n.right = std::max(n.right + dx, n.left + kSmallestW);
+    if (e == HTTOP || e == HTTOPLEFT || e == HTTOPRIGHT) n.top = std::min(n.top + dy, n.bottom - kSmallestH);
+    if (e == HTBOTTOM || e == HTBOTTOMLEFT || e == HTBOTTOMRIGHT) n.bottom = std::max(n.bottom + dy, n.top + kSmallestH);
+    SetWindowPos(g_drag.window, nullptr, n.left, n.top, n.right - n.left, n.bottom - n.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetCursor(LoadCursorW(nullptr, EdgeCursor(e)));
+}
+
+/* A move let go at the screen's top (maximized) or its left or right edge (that half). */
+void Snap(const POINT& at) {
+    MONITORINFO m{};
+    m.cbSize = sizeof m;
+    if (!GetMonitorInfoW(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST), &m)) return;
+    const RECT& w = m.rcWork;
+    constexpr int kNear = 2;
+    if (at.y <= m.rcMonitor.top + kNear) {
+        ShowWindow(g_drag.window, SW_MAXIMIZE);
+    } else if (at.x <= m.rcMonitor.left + kNear || at.x >= m.rcMonitor.right - 1 - kNear) {
+        const int half = (w.right - w.left) / 2;
+        const int left = at.x <= m.rcMonitor.left + kNear ? w.left : w.left + half;
+        SetWindowPos(g_drag.window, nullptr, left, w.top, half, w.bottom - w.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+void EndDrag() {
+    g_drag.edge = 0;
+    if (GetCapture() == g_drag.window) ReleaseCapture();
+}
+
+bool SDLCALL WindowMessages(void*, MSG* m) {
+    if (!g_drag.window || m->hwnd != g_drag.window) return true;
+    // The pointer taken from the window meanwhile (another window's, Alt+Tab): the drag over.
+    if (g_drag.edge && GetCapture() != g_drag.window) g_drag.edge = 0;
+    switch (m->message) {
+        case WM_NCLBUTTONDOWN: {
+            const WPARAM hit = m->wParam;
+            if (hit != HTCAPTION && !(hit >= HTLEFT && hit <= HTBOTTOMRIGHT)) return true;   // (its buttons: Windows')
+            if (IsZoomed(m->hwnd) && hit != HTCAPTION) return true;
+            POINT at;
+            GetCursorPos(&at);
+            if (IsZoomed(m->hwnd)) {
+                // Maximized: its own size again, under the pointer as far across as it was.
+                RECT big{};
+                GetWindowRect(m->hwnd, &big);
+                const double across = big.right > big.left ? double(at.x - big.left) / double(big.right - big.left) : 0.5;
+                ShowWindow(m->hwnd, SW_RESTORE);
+                RECT small{};
+                GetWindowRect(m->hwnd, &small);
+                const int w = small.right - small.left, h = small.bottom - small.top;
+                const int left = at.x - int(across * double(w)), top = at.y - (at.y - big.top);
+                SetWindowPos(m->hwnd, nullptr, left, top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            g_drag.edge = hit;
+            g_drag.from = at;
+            GetWindowRect(m->hwnd, &g_drag.rect);
+            SetForegroundWindow(m->hwnd);
+            SetCapture(m->hwnd);
+            if (hit != HTCAPTION) SetCursor(LoadCursorW(nullptr, EdgeCursor(hit)));
+            return false;
+        }
+        case WM_MOUSEMOVE:
+        case WM_NCMOUSEMOVE:
+            if (!g_drag.edge) return true;
+            {
+                POINT at;
+                GetCursorPos(&at);
+                DragTo(at);
+            }
+            return false;
+        case WM_LBUTTONUP:
+        case WM_NCLBUTTONUP:
+            if (!g_drag.edge) return true;
+            {
+                POINT at;
+                GetCursorPos(&at);
+                DragTo(at);
+                if (g_drag.edge == HTCAPTION) Snap(at);
+            }
+            EndDrag();
+            return false;
+        case WM_KEYDOWN:
+            if (!g_drag.edge || m->wParam != VK_ESCAPE) return true;
+            SetWindowPos(g_drag.window, nullptr, g_drag.rect.left, g_drag.rect.top, g_drag.rect.right - g_drag.rect.left,
+                         g_drag.rect.bottom - g_drag.rect.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            EndDrag();
+            return false;
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
+            return !g_drag.edge;            // (the game sees no click while the window moves)
+        default:
+            return true;
+    }
+}
 #endif
 
 }  // namespace
@@ -154,6 +291,9 @@ bool SdlWindowDisplay::OpenWindow(const char* title, int width, int height, SDL_
             SDL_GetPointerProperty(SDL_GetWindowProperties(window_), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr))) {
         vblank_watch_ = std::make_shared<VblankWatch>();
         std::thread(WatchVblanks, vblank_watch_, hwnd).detach();
+        // Moved and resized with the game running on (WindowMessages).
+        g_drag.window = hwnd;
+        SDL_SetWindowsMessageHook(WindowMessages, nullptr);
     }
 #endif
     return true;
@@ -217,6 +357,41 @@ void SdlWindowDisplay::SetFullscreen(bool on) {
     stale_ = true;
 }
 
+/* Pump's: a placement asked for (SetPlacement), and the desktop's usable
+   area now and then (DesktopArea). */
+void SdlWindowDisplay::ApplyPlacement() {
+    if (!window_) return;
+    Placement p;
+    {
+        std::lock_guard<std::mutex> hold(placement_lock_);
+        p = placement_;
+        placement_.pending = false;
+    }
+    if (p.pending) {
+        if (Fullscreen()) SDL_SetWindowFullscreen(window_, false);
+        SDL_SetWindowBordered(window_, !p.borderless);
+        if (p.w > 0 && p.h > 0) SDL_SetWindowSize(window_, p.w, p.h);
+        SDL_SetWindowPosition(window_, p.x, p.y);
+        stale_ = true;
+        std::fprintf(stderr, "[window] placed at %d,%d, %dx%d%s\n", p.x, p.y, p.w, p.h, p.borderless ? ", borderless" : "");
+    }
+    if (raise_.exchange(false)) SDL_RaiseWindow(window_);
+    // The mouse captured while asked and the window has the focus (let go
+    // the moment it has not: another window's mouse is the player's).
+    const bool capture = capture_mouse_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    if (capture != mouse_captured_) {
+        mouse_captured_ = capture;
+        SDL_SetWindowRelativeMouseMode(window_, capture);
+    }
+    if (desktop_age_++ % 120 == 0) {
+        SDL_Rect r{};
+        if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(window_), &r)) {
+            std::lock_guard<std::mutex> hold(placement_lock_);
+            desktop_[0] = r.x, desktop_[1] = r.y, desktop_[2] = r.w, desktop_[3] = r.h;
+        }
+    }
+}
+
 bool SdlWindowDisplay::Fullscreen() const {
     return window_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) != 0;
 }
@@ -268,6 +443,7 @@ bool SdlWindowDisplay::Pump() {
             }
         }
     }
+    ApplyPlacement();
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
@@ -288,7 +464,14 @@ bool SdlWindowDisplay::Pump() {
                 SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK))
                 capture_ = true;
         }
-        if (e.type == SDL_EVENT_MOUSE_MOTION) MouseAt(e.motion.x, e.motion.y);
+        if (e.type == SDL_EVENT_MOUSE_MOTION) {
+            {
+                std::lock_guard<std::mutex> hold(mouse_lock_);
+                mouse_.dx += e.motion.xrel;
+                mouse_.dy += e.motion.yrel;
+            }
+            if (!mouse_captured_) MouseAt(e.motion.x, e.motion.y);
+        }
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) {
             MouseAt(e.button.x, e.button.y);
             const int bit = e.button.button == SDL_BUTTON_LEFT ? 0 : e.button.button == SDL_BUTTON_MIDDLE ? 1
@@ -297,18 +480,24 @@ bool SdlWindowDisplay::Pump() {
             if (bit >= 0 && e.button.down) {
                 mouse_.held |= 1u << bit;
                 mouse_.pressed |= 1u << bit;
+                panel_mouse_.held |= 1u << bit;
+                panel_mouse_.pressed |= 1u << bit;
             } else if (bit >= 0) {
                 mouse_.held &= ~(1u << bit);
+                panel_mouse_.held &= ~(1u << bit);
             }
         }
         if (e.type == SDL_EVENT_MOUSE_WHEEL) {
             std::lock_guard<std::mutex> hold(mouse_lock_);
             mouse_.wheel += e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
+            panel_mouse_.wheel += e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
         }
         if (e.type == SDL_EVENT_WINDOW_MOUSE_LEAVE) {
             std::lock_guard<std::mutex> hold(mouse_lock_);
             mouse_.over = false;
             mouse_.held = 0;
+            panel_mouse_.over = false;
+            panel_mouse_.held = 0;
         }
         if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
             std::lock_guard<std::mutex> hold(mouse_lock_);
@@ -347,6 +536,10 @@ void SdlWindowDisplay::MouseAt(float x, float y) {
     const float density = window_ ? SDL_GetWindowPixelDensity(window_) : 1.0f;
     const float px = x * (density > 0.0f ? density : 1.0f), py = y * (density > 0.0f ? density : 1.0f);
     std::lock_guard<std::mutex> hold(mouse_lock_);
+    if (px != panel_mouse_.px || py != panel_mouse_.py || !panel_mouse_.over) panel_mouse_.moved = true;
+    panel_mouse_.over = true;
+    panel_mouse_.px = px;
+    panel_mouse_.py = py;
     if (px != mouse_px_ || py != mouse_py_ || !mouse_.over) mouse_.moved = true;
     mouse_px_ = px;
     mouse_py_ = py;
@@ -356,8 +549,8 @@ void SdlWindowDisplay::MouseAt(float x, float y) {
 }
 
 /* The window's pointer: the game's, at a size that goes with the picture's
-   (its art's height a twentieth of the picture's), while the game wants it;
-   otherwise the system's - hidden in fullscreen. */
+   (its art's height a 22nd of the picture's: 49 pixels at 1080), while the game wants it; otherwise the system's - hidden
+   in fullscreen; none while HidePointer(true). */
 void SdlWindowDisplay::UpdateCursor() {
     if (!window_) return;
 #ifdef __ANDROID__
@@ -366,34 +559,39 @@ void SdlWindowDisplay::UpdateCursor() {
     return;
 #endif
     const bool want = cursor_wanted_.load();
-    std::uint32_t size = std::uint32_t(float(shown_h_.load()) / 20.0f + 0.5f);
+    // (`size`: the pointer's height.)
+    std::uint32_t size = std::uint32_t(float(shown_h_.load()) / 22.0f + 0.5f);
     size = std::clamp<std::uint32_t>(size, 20, 128);
     if (want) {
         std::lock_guard<std::mutex> hold(mouse_lock_);
         if (!cursor_art_.empty() && (!cursor_ || cursor_size_ != size)) {
-            // The art resampled to `size` (bilinear, by premultiplied colour).
-            const std::uint32_t w = size, h = std::uint32_t(float(size) * float(cursor_height_) /
-                                                            float(cursor_width_) + 0.5f);
+            // The art resampled to `size` high (bilinear, by premultiplied
+            // colour; smaller than the art, n x n samples a pixel averaged).
+            const std::uint32_t h = size, w = std::max<std::uint32_t>(1, std::uint32_t(float(size) * float(cursor_width_) /
+                                                                                       float(cursor_height_) + 0.5f));
+            const int n = std::clamp(int(std::ceil(float(cursor_height_) / float(h))), 1, 8);
             SDL_Surface* surface = SDL_CreateSurface(int(w), int(h), SDL_PIXELFORMAT_RGBA32);
             if (surface) {
                 for (std::uint32_t y = 0; y < h; ++y) {
                     auto* row = reinterpret_cast<std::uint8_t*>(surface->pixels) + std::size_t(y) * surface->pitch;
                     for (std::uint32_t x = 0; x < w; ++x) {
-                        const float sx = (float(x) + 0.5f) * float(cursor_width_) / float(w) - 0.5f;
-                        const float sy = (float(y) + 0.5f) * float(cursor_height_) / float(h) - 0.5f;
-                        const int x0 = int(std::floor(sx)), y0 = int(std::floor(sy));
-                        const float fx = sx - float(x0), fy = sy - float(y0);
                         float sum[4] = {};
-                        for (int k = 0; k < 4; ++k) {
-                            const int ix = std::clamp(x0 + (k & 1), 0, int(cursor_width_) - 1);
-                            const int iy = std::clamp(y0 + (k >> 1), 0, int(cursor_height_) - 1);
-                            const float weight = ((k & 1) ? fx : 1.0f - fx) * ((k >> 1) ? fy : 1.0f - fy);
-                            const std::uint32_t p = cursor_art_[std::size_t(iy) * cursor_width_ + ix];
-                            const float a = float(p >> 24) / 255.0f;
-                            sum[0] += weight * float(p & 0xFF) * a;
-                            sum[1] += weight * float((p >> 8) & 0xFF) * a;
-                            sum[2] += weight * float((p >> 16) & 0xFF) * a;
-                            sum[3] += weight * a;
+                        for (int j = 0; j < n * n; ++j) {
+                            const float sx = (float(x) + (float(j % n) + 0.5f) / float(n)) * float(cursor_width_) / float(w) - 0.5f;
+                            const float sy = (float(y) + (float(j / n) + 0.5f) / float(n)) * float(cursor_height_) / float(h) - 0.5f;
+                            const int x0 = int(std::floor(sx)), y0 = int(std::floor(sy));
+                            const float fx = sx - float(x0), fy = sy - float(y0);
+                            for (int k = 0; k < 4; ++k) {
+                                const int ix = std::clamp(x0 + (k & 1), 0, int(cursor_width_) - 1);
+                                const int iy = std::clamp(y0 + (k >> 1), 0, int(cursor_height_) - 1);
+                                const float weight = ((k & 1) ? fx : 1.0f - fx) * ((k >> 1) ? fy : 1.0f - fy) / float(n * n);
+                                const std::uint32_t p = cursor_art_[std::size_t(iy) * cursor_width_ + ix];
+                                const float a = float(p >> 24) / 255.0f;
+                                sum[0] += weight * float(p & 0xFF) * a;
+                                sum[1] += weight * float((p >> 8) & 0xFF) * a;
+                                sum[2] += weight * float((p >> 16) & 0xFF) * a;
+                                sum[3] += weight * a;
+                            }
                         }
                         const float a = sum[3];
                         row[4 * x + 0] = std::uint8_t(a > 0.0f ? std::min(255.0f, sum[0] / a + 0.5f) : 0.0f);
@@ -417,11 +615,13 @@ void SdlWindowDisplay::UpdateCursor() {
             }
         }
     }
-    const int showing = want && cursor_ ? 1 : 0;
+    const int showing = pointer_hidden_.load() ? 2 : want && cursor_ ? 1 : 0;
     if (showing == cursor_showing_ && !(showing == 0 && fullscreen_cursor_stale_)) return;
     cursor_showing_ = showing;
     fullscreen_cursor_stale_ = false;
-    if (showing) {
+    if (showing == 2) {
+        SDL_HideCursor();
+    } else if (showing) {
         SDL_SetCursor(cursor_);
         SDL_ShowCursor();
     } else {
@@ -555,7 +755,8 @@ std::vector<Display::ControllerInfo> SdlWindowDisplay::Controllers() const {
         std::lock_guard<std::mutex> hold(pads_lock_);
         for (const Gamepad& g : pads_) {
             const char* name = SDL_GetGamepadName(g.pad);
-            list.push_back({g.id, name ? name : "Controller", FamilyOf(g.pad)});
+            const char* path = SDL_GetGamepadPath(g.pad);
+            list.push_back({g.id, name ? name : "Controller", FamilyOf(g.pad), path ? path : ""});
         }
     }
     std::lock_guard<std::mutex> hold(g_touch_lock);
